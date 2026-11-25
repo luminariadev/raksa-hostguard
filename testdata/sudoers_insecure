@@ -1,0 +1,4 @@
+# Intentionally insecure sudoers configuration for test validation
+Defaults !authenticate
+ops ALL=(ALL) NOPASSWD: ALL
+deploy ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart *

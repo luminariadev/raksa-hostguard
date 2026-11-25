@@ -1,9 +1,12 @@
 pub mod docker;
+pub mod host;
 pub mod ssh;
 
+use crate::schema::Finding;
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
+use walkdir::WalkDir;
 
 pub const MAX_CONFIG_BYTES: usize = 1024 * 1024; // 1 MiB cap for static config parsing
 
@@ -35,10 +38,67 @@ pub(crate) fn read_bounded_text(path: &Path) -> io::Result<String> {
     String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+pub fn audit_workspace(root: &Path) -> io::Result<Vec<Finding>> {
+    if !root.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("workspace path {:?} does not exist", root),
+        ));
+    }
+
+    let mut files = Vec::new();
+    let walker = WalkDir::new(root).follow_links(false).into_iter();
+    for entry in walker.filter_entry(|e| !is_ignored_dir(e.path())) {
+        let entry = entry?;
+        if entry.file_type().is_file() {
+            files.push(entry.into_path());
+        }
+    }
+    files.sort();
+
+    let mut findings = Vec::new();
+    for path in files {
+        let fname = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        if is_docker_manifest(&fname) {
+            findings.extend(docker::audit_docker_path(&path)?);
+        } else if fname == "sshd_config" || (fname.starts_with("sshd_") && fname.ends_with(".conf"))
+        {
+            findings.extend(ssh::audit_sshd_file(&path)?);
+        } else if fname.contains("sysctl") && fname.ends_with(".conf") {
+            findings.extend(host::audit_sysctl_path(&path)?);
+        } else if fname.starts_with("sudoers") {
+            findings.extend(host::audit_sudoers_path(&path)?);
+        }
+    }
+
+    Ok(findings)
+}
+
+fn is_ignored_dir(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    matches!(name, ".git" | "target" | "node_modules" | "vendor")
+}
+
+fn is_docker_manifest(lower_name: &str) -> bool {
+    lower_name == "dockerfile"
+        || lower_name.starts_with("dockerfile.")
+        || lower_name.ends_with(".dockerfile")
+        || (lower_name.contains("compose")
+            && (lower_name.ends_with(".yml") || lower_name.ends_with(".yaml")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::docker::{audit_compose, audit_docker_path, audit_dockerfile};
     use super::ssh::audit_sshd_file;
+    use super::{audit_workspace, host};
     use std::collections::HashSet;
     use std::fs;
     use std::path::Path;
@@ -199,6 +259,84 @@ mod tests {
         assert!(
             findings.is_empty(),
             "ignored dirs should be skipped during scan: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn sysctl_and_sudoers_fixtures_enforce_cis_hardening() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        let sys_clean = host::audit_sysctl_path(&root.join("testdata/sysctl_hardened.conf"))
+            .expect("hardened sysctl");
+        assert!(
+            sys_clean.is_empty(),
+            "hardened sysctl should produce 0 findings: {sys_clean:?}"
+        );
+
+        let sys_bad = host::audit_sysctl_path(&root.join("testdata/sysctl_insecure.conf"))
+            .expect("insecure sysctl");
+        let sys_rules: HashSet<&str> = sys_bad.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(sys_rules.contains("HOST-301"), "missing HOST-301");
+        assert!(sys_rules.contains("HOST-302"), "missing HOST-302");
+
+        let sudo_clean = host::audit_sudoers_path(&root.join("testdata/sudoers_hardened"))
+            .expect("hardened sudoers");
+        assert!(
+            sudo_clean.is_empty(),
+            "hardened sudoers should produce 0 findings: {sudo_clean:?}"
+        );
+
+        let sudo_bad = host::audit_sudoers_path(&root.join("testdata/sudoers_insecure"))
+            .expect("insecure sudoers");
+        assert!(
+            sudo_bad.iter().any(|f| f.rule_id == "HOST-304"),
+            "missing HOST-304: {sudo_bad:?}"
+        );
+    }
+
+    #[test]
+    fn host_permissions_detect_world_writable_suid_and_exposed_keys() {
+        let entries = vec![
+            ("/etc/app.conf".to_string(), 0o644),
+            ("/home/deploy/.ssh/id_ed25519".to_string(), 0o600),
+            ("/tmp/world_write.sh".to_string(), 0o777),
+            ("/usr/local/bin/escalate".to_string(), 0o4755),
+            ("/etc/shadow".to_string(), 0o644),
+            ("/home/deploy/.ssh/id_rsa".to_string(), 0o644),
+        ];
+        let findings = host::audit_permissions_entries(&entries);
+        assert_eq!(findings.len(), 4);
+        assert!(findings.iter().all(|f| f.rule_id == "HOST-303"));
+    }
+
+    #[test]
+    fn workspace_audit_aggregates_ssh_docker_sysctl_and_sudoers() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("Dockerfile"), "FROM ubuntu:latest\n").unwrap();
+        fs::write(dir.path().join("sshd_config"), "PermitRootLogin yes\n").unwrap();
+        fs::write(
+            dir.path().join("99-sysctl.conf"),
+            "kernel.randomize_va_space = 0\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("sudoers_custom"),
+            "ops ALL=(ALL) NOPASSWD: ALL\n",
+        )
+        .unwrap();
+
+        let vendor = dir.path().join("vendor");
+        fs::create_dir_all(&vendor).unwrap();
+        fs::write(vendor.join("sshd_config"), "PermitEmptyPasswords yes\n").unwrap();
+
+        let findings = audit_workspace(dir.path()).expect("workspace scan");
+        let rules: HashSet<&str> = findings.iter().map(|f| f.rule_id.as_str()).collect();
+        for expected in ["HOST-101", "HOST-201", "HOST-204", "HOST-302", "HOST-304"] {
+            assert!(rules.contains(expected), "missing {expected}: {findings:?}");
+        }
+        assert!(
+            !rules.contains("HOST-103"),
+            "vendor/ directory must be ignored: {findings:?}"
         );
     }
 }

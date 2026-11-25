@@ -1,0 +1,6 @@
+# Hardened sudoers policy example
+Defaults env_reset
+Defaults use_pty
+Defaults logfile="/var/log/sudo.log"
+root ALL=(ALL:ALL) ALL
+%sudo ALL=(ALL:ALL) ALL
