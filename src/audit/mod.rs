@@ -118,11 +118,64 @@ mod tests {
             "builder root should not trigger HOST-201 when final stage is non-root: {findings:?}"
         );
 
-        let compose = "services:\n  api:\n    image: myapp:1.2.0\n    environment:\n      SECRET_KEY: ${RUNTIME_SECRET}\n      TOKEN: $CI_TOKEN\n";
+        let compose = "services:\n  api:\n    image: myapp:1.2.0\n    cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true\n    environment:\n      SECRET_KEY: ${RUNTIME_SECRET}\n      TOKEN: $CI_TOKEN\n";
         let cmp_findings = audit_compose(compose, "inline-compose.yml").expect("valid yaml");
         assert!(
             cmp_findings.is_empty(),
             "env var interpolation should not trigger HOST-205: {cmp_findings:?}"
+        );
+    }
+
+    #[test]
+    fn ssh_weak_crypto_forwarding_and_include_rules_work() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let crypto = audit_sshd_file(&root.join("testdata/sshd_weak_crypto.conf"))
+            .expect("weak crypto fixture");
+        let rules: HashSet<&str> = crypto.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(rules.contains("HOST-105"), "missing HOST-105: {crypto:?}");
+        assert!(rules.contains("HOST-106"), "missing HOST-106: {crypto:?}");
+
+        let clean = audit_sshd_file(&root.join("testdata/sshd_hardened.conf"))
+            .expect("hardened sshd fixture");
+        assert!(
+            clean.is_empty(),
+            "hardened sshd should stay clean: {clean:?}"
+        );
+
+        // Verify Include drop-in resolution.
+        let dir = tempdir().unwrap();
+        let dropins = dir.path().join("sshd_config.d");
+        fs::create_dir_all(&dropins).unwrap();
+        fs::write(dropins.join("10-weak.conf"), "AllowTcpForwarding yes\n").unwrap();
+        let main_cfg = dir.path().join("sshd_config");
+        fs::write(
+            &main_cfg,
+            "Include sshd_config.d/*.conf\nPermitRootLogin no\n",
+        )
+        .unwrap();
+
+        let inc_findings = audit_sshd_file(&main_cfg).expect("audit include");
+        assert!(
+            inc_findings.iter().any(|f| f.rule_id == "HOST-106"),
+            "Include drop-in directive should trigger HOST-106: {inc_findings:?}"
+        );
+    }
+
+    #[test]
+    fn compose_unconfined_seccomp_cap_drop_and_ports_trigger_v2_rules() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let findings = audit_docker_path(&root.join("testdata/docker-compose.unconfined.yml"))
+            .expect("audit unconfined compose");
+        let rules: HashSet<&str> = findings.iter().map(|f| f.rule_id.as_str()).collect();
+        for expected in ["HOST-207", "HOST-208", "HOST-209"] {
+            assert!(rules.contains(expected), "missing {expected}: {findings:?}");
+        }
+
+        let clean = audit_docker_path(&root.join("testdata/docker-compose.hardened.yml"))
+            .expect("hardened compose");
+        assert!(
+            clean.is_empty(),
+            "hardened compose should still yield 0 findings: {clean:?}"
         );
     }
 

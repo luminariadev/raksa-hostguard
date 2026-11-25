@@ -346,6 +346,25 @@ pub fn audit_compose(content: &str, source_label: &str) -> Result<Vec<Finding>, 
                         &format!("{svc_name}-sock"),
                         now,
                     ));
+                } else if let Some(sensitive_src) = sensitive_host_bind_source(vol) {
+                    let mut ev = Map::new();
+                    ev.insert("service".to_string(), json!(svc_name));
+                    ev.insert("host_source".to_string(), json!(sensitive_src));
+                    ev.insert("cis_ref".to_string(), json!("CIS Docker 5.5"));
+                    findings.push(docker_finding(
+                        "HOST-208",
+                        Severity::Medium,
+                        "Compose service omits cap_drop ALL or binds sensitive host path",
+                        format!(
+                            "Compose service '{svc_name}' bind-mounts sensitive host path '{sensitive_src}'."
+                        ),
+                        &svc_target,
+                        ev,
+                        "Avoid mounting sensitive host OS directories into containers; use scoped data volumes instead.",
+                        "D3-NI",
+                        &format!("{svc_name}-vol-{}", sanitize_id_part(&sensitive_src)),
+                        now,
+                    ));
                 }
             }
         }
@@ -461,6 +480,128 @@ pub fn audit_compose(content: &str, source_label: &str) -> Result<Vec<Finding>, 
                         "Replace literal credentials with ${ENV_VAR} interpolation or Compose secrets.",
                         "D3-SM",
                         &format!("{svc_name}-env-{}", sanitize_id_part(&k)),
+                        now,
+                    ));
+                }
+            }
+        }
+
+        let sec_opts: Vec<String> = svc
+            .get(Value::String("security_opt".to_string()))
+            .and_then(|v| v.as_sequence())
+            .map(|seq| {
+                seq.iter()
+                    .filter_map(|item| item.as_str().map(|s| s.trim().to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let has_no_new_privs = sec_opts.iter().any(|opt| {
+            let low = opt.to_ascii_lowercase();
+            low == "no-new-privileges"
+                || low == "no-new-privileges:true"
+                || low == "no-new-privileges=true"
+        });
+        if !has_no_new_privs {
+            let mut ev = Map::new();
+            ev.insert("service".to_string(), json!(svc_name));
+            ev.insert("missing".to_string(), json!("no-new-privileges:true"));
+            ev.insert("cis_ref".to_string(), json!("CIS Docker 5.25"));
+            findings.push(docker_finding(
+                "HOST-207",
+                Severity::Medium,
+                "Compose service missing no-new-privileges hardening",
+                format!(
+                    "Compose service '{svc_name}' does not set security_opt: [no-new-privileges:true]."
+                ),
+                &svc_target,
+                ev,
+                "Add security_opt: ['no-new-privileges:true'] to block privilege escalation via setuid binaries.",
+                "D3-LPM",
+                &format!("{svc_name}-nonewpriv"),
+                now,
+            ));
+        }
+
+        for opt in &sec_opts {
+            let low = opt.to_ascii_lowercase();
+            if low.contains("seccomp:unconfined")
+                || low.contains("seccomp=unconfined")
+                || low.contains("apparmor:unconfined")
+                || low.contains("apparmor=unconfined")
+            {
+                let mut ev = Map::new();
+                ev.insert("service".to_string(), json!(svc_name));
+                ev.insert("security_opt".to_string(), json!(opt));
+                ev.insert("cis_ref".to_string(), json!("CIS Docker 5.1 / 5.21"));
+                findings.push(docker_finding(
+                    "HOST-209",
+                    Severity::High,
+                    "Container disables Seccomp/AppArmor or exposes sensitive port publicly",
+                    format!("Compose service '{svc_name}' disables kernel sandboxing via '{opt}'."),
+                    &svc_target,
+                    ev,
+                    "Remove unconfined seccomp/apparmor overrides and enforce default or custom restrictive profiles.",
+                    "D3-NI",
+                    &format!("{svc_name}-unconfined"),
+                    now,
+                ));
+            }
+        }
+
+        let has_cap_drop_all = svc
+            .get(Value::String("cap_drop".to_string()))
+            .and_then(|v| v.as_sequence())
+            .map(|seq| {
+                seq.iter().any(|item| {
+                    item.as_str()
+                        .map(|s| s.trim().eq_ignore_ascii_case("ALL"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        if !has_cap_drop_all {
+            let mut ev = Map::new();
+            ev.insert("service".to_string(), json!(svc_name));
+            ev.insert("missing".to_string(), json!("cap_drop: [ALL]"));
+            ev.insert("cis_ref".to_string(), json!("CIS Docker 5.3"));
+            findings.push(docker_finding(
+                "HOST-208",
+                Severity::Medium,
+                "Compose service omits cap_drop ALL or binds sensitive host path",
+                format!("Compose service '{svc_name}' does not drop ALL Linux capabilities."),
+                &svc_target,
+                ev,
+                "Add cap_drop: [ALL] and re-add only strictly required non-privileged capabilities.",
+                "D3-NI",
+                &format!("{svc_name}-capdrop"),
+                now,
+            ));
+        }
+
+        if let Some(ports) = svc
+            .get(Value::String("ports".to_string()))
+            .and_then(|v| v.as_sequence())
+        {
+            for port_val in ports {
+                if let Some((bind_desc, host_port)) = detect_exposed_sensitive_port(port_val) {
+                    let mut ev = Map::new();
+                    ev.insert("service".to_string(), json!(svc_name));
+                    ev.insert("published_port".to_string(), json!(host_port));
+                    ev.insert("binding".to_string(), json!(bind_desc));
+                    ev.insert("cis_ref".to_string(), json!("CIS Docker 5.13"));
+                    findings.push(docker_finding(
+                        "HOST-209",
+                        Severity::High,
+                        "Container disables Seccomp/AppArmor or exposes sensitive port publicly",
+                        format!(
+                            "Compose service '{svc_name}' publishes sensitive port {host_port} on wildcard interface ({bind_desc})."
+                        ),
+                        &svc_target,
+                        ev,
+                        "Bind internal admin/datastore ports to 127.0.0.1 (e.g., 127.0.0.1:6379:6379) or keep them inside private container networks.",
+                        "D3-NI",
+                        &format!("{svc_name}-port-{host_port}"),
                         now,
                     ));
                 }
@@ -635,6 +776,107 @@ fn unquote(s: &str) -> String {
         s[1..s.len() - 1].to_string()
     } else {
         s.to_string()
+    }
+}
+
+fn sensitive_host_bind_source(vol: &Value) -> Option<String> {
+    let raw_src = match vol {
+        Value::String(s) => s.split(':').next().unwrap_or("").trim().to_string(),
+        Value::Mapping(m) => {
+            if let Some(kind) = mapping_str(m, "type") {
+                if !kind.eq_ignore_ascii_case("bind") {
+                    return None;
+                }
+            }
+            mapping_str(m, "source").unwrap_or_default()
+        }
+        _ => String::new(),
+    };
+    let clean = raw_src.trim();
+    if !clean.starts_with('/') {
+        return None;
+    }
+    let normalized = if clean == "/" {
+        "/"
+    } else {
+        clean.trim_end_matches('/')
+    };
+    const SENSITIVE_PREFIXES: &[&str] = &["/etc", "/proc", "/sys", "/boot", "/root"];
+    if normalized == "/"
+        || SENSITIVE_PREFIXES
+            .iter()
+            .any(|p| normalized == *p || normalized.starts_with(&format!("{p}/")))
+    {
+        Some(clean.to_string())
+    } else {
+        None
+    }
+}
+
+fn is_sensitive_port(port: u16) -> bool {
+    matches!(port, 22 | 2375 | 2376 | 3306 | 5432 | 6379 | 27017)
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let h = host
+        .trim()
+        .trim_matches('[')
+        .trim_matches(']')
+        .to_ascii_lowercase();
+    h == "127.0.0.1" || h == "localhost" || h == "::1"
+}
+
+fn detect_exposed_sensitive_port(val: &Value) -> Option<(String, u16)> {
+    match val {
+        Value::String(raw) => {
+            let trimmed = raw.trim();
+            let without_proto = trimmed.split('/').next().unwrap_or(trimmed);
+            let (host_opt, port_str) = if let Some(rest) = without_proto.strip_prefix('[') {
+                if let Some((ip, tail)) = rest.split_once("]:") {
+                    let hp = tail.split(':').next().unwrap_or("");
+                    (Some(ip), hp)
+                } else {
+                    (None, "")
+                }
+            } else {
+                let parts: Vec<&str> = without_proto.split(':').collect();
+                match parts.len() {
+                    1 => (None, parts[0]),
+                    2 => (None, parts[0]),
+                    3 => (Some(parts[0]), parts[1]),
+                    _ => (None, ""),
+                }
+            };
+
+            if host_opt.is_some_and(is_loopback_host) {
+                return None;
+            }
+            let port_num = port_str
+                .split('-')
+                .next()
+                .unwrap_or("")
+                .parse::<u16>()
+                .ok()?;
+            if is_sensitive_port(port_num) {
+                Some((trimmed.to_string(), port_num))
+            } else {
+                None
+            }
+        }
+        Value::Mapping(m) => {
+            let host_ip = mapping_str(m, "host_ip").unwrap_or_else(|| "0.0.0.0".to_string());
+            if is_loopback_host(&host_ip) {
+                return None;
+            }
+            let published = mapping_str(m, "published")?;
+            let port_num = published.parse::<u16>().ok()?;
+            if is_sensitive_port(port_num) {
+                Some((format!("{host_ip}:{published}"), port_num))
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 

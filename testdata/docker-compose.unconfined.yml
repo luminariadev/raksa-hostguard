@@ -1,0 +1,11 @@
+# Intentionally weak container isolation fixture (HOST-207, HOST-208, HOST-209)
+services:
+  cache:
+    image: redis:7.4.2-alpine
+    user: "999:999"
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - /etc:/host_etc:ro
+    ports:
+      - "6379:6379"

@@ -619,7 +619,7 @@ mod tests {
                 "name": "hostguard_audit_docker",
                 "arguments": {
                     "kind": "compose",
-                    "content": "services:\n  app:\n    image: nginx:latest\n    environment:\n      DB_PASSWORD: super_secret_value\n"
+                    "content": "services:\n  app:\n    image: nginx:latest\n    cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true\n    environment:\n      DB_PASSWORD: super_secret_value\n"
                 }
             }
         })
