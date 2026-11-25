@@ -1,10 +1,19 @@
+use crate::audit::audit_workspace;
 use crate::audit::docker::{audit_compose, audit_docker_path, audit_dockerfile};
+use crate::audit::host::{
+    audit_host_permissions_path, audit_sudoers_content, audit_sudoers_path, audit_sysctl_content,
+    audit_sysctl_path,
+};
 use crate::audit::ssh::{audit_sshd_config, audit_sshd_file};
 use crate::audit::MAX_CONFIG_BYTES;
 use crate::fim::hash::DEFAULT_MAX_FILE_BYTES;
-use crate::fim::{create_snapshot, load_snapshot, save_snapshot, verify_snapshot};
+use crate::fim::{
+    create_snapshot_with_workers, default_worker_count, load_snapshot, save_snapshot,
+    sign_snapshot, verify_snapshot_signed,
+};
+use crate::policy::{apply_policy, load_policy};
 use crate::schema::catalog::rule_catalog;
-use crate::schema::Report;
+use crate::schema::{Finding, Report};
 use chrono::Utc;
 use serde_json::{json, Map, Value};
 use std::io::{self, BufRead, BufWriter, Write};
@@ -167,6 +176,8 @@ fn handle_tool_call(req_id: Value, params: &Map<String, Value>) -> Value {
         "hostguard_fim_check" => call_fim_check(req_id, &args),
         "hostguard_audit_ssh" => call_audit_ssh(req_id, &args),
         "hostguard_audit_docker" => call_audit_docker(req_id, &args),
+        "hostguard_audit_host" => call_audit_host(req_id, &args),
+        "hostguard_audit_workspace" => call_audit_workspace(req_id, &args),
         unknown => rpc_error(req_id, -32602, &format!("Unknown tool: {unknown}")),
     }
 }
@@ -242,8 +253,27 @@ fn call_fim_snapshot(req_id: Value, args: &Map<String, Value>) -> Value {
         },
     };
 
-    match create_snapshot(&roots, &excludes, max_file_bytes) {
-        Ok((snapshot, stats)) => {
+    let workers = match parse_workers_arg(args) {
+        Ok(w) => w,
+        Err(msg) => return rpc_error(req_id, -32602, &msg),
+    };
+
+    let sign_key = match read_sign_key_env(args) {
+        Ok(k) => k,
+        Err(McpKeyError::InvalidParam(msg)) => return rpc_error(req_id, -32602, &msg),
+        Err(McpKeyError::Runtime(msg)) => return rpc_result(req_id, tool_err(&msg)),
+    };
+
+    match create_snapshot_with_workers(&roots, &excludes, max_file_bytes, workers) {
+        Ok((mut snapshot, stats)) => {
+            if let Some(key) = &sign_key {
+                if let Err(err) = sign_snapshot(&mut snapshot, key) {
+                    return rpc_result(
+                        req_id,
+                        tool_err(&format!("failed to sign snapshot: {err}")),
+                    );
+                }
+            }
             if let Err(err) = save_snapshot(Path::new(baseline_out), &snapshot) {
                 return rpc_result(req_id, tool_err(&format!("failed to save snapshot: {err}")));
             }
@@ -251,6 +281,7 @@ fn call_fim_snapshot(req_id: Value, args: &Map<String, Value>) -> Value {
             let payload = json!({
                 "status": "created",
                 "baseline_out": baseline_out,
+                "signed": sign_key.is_some(),
                 "files_hashed": stats.files_hashed,
                 "files_skipped_oversize": stats.files_skipped_oversize,
                 "files_skipped_error": stats.files_skipped_error,
@@ -278,6 +309,17 @@ fn call_fim_check(req_id: Value, args: &Map<String, Value>) -> Value {
         );
     };
 
+    let workers = match parse_workers_arg(args) {
+        Ok(w) => w,
+        Err(msg) => return rpc_error(req_id, -32602, &msg),
+    };
+
+    let sign_key = match read_sign_key_env(args) {
+        Ok(k) => k,
+        Err(McpKeyError::InvalidParam(msg)) => return rpc_error(req_id, -32602, &msg),
+        Err(McpKeyError::Runtime(msg)) => return rpc_result(req_id, tool_err(&msg)),
+    };
+
     let snapshot = match load_snapshot(Path::new(baseline_path)) {
         Ok(s) => s,
         Err(err) => {
@@ -288,9 +330,14 @@ fn call_fim_check(req_id: Value, args: &Map<String, Value>) -> Value {
         }
     };
 
-    match verify_snapshot(&snapshot) {
+    match verify_snapshot_signed(&snapshot, sign_key.as_deref(), workers) {
         Ok(findings) => {
-            let report = Report::new(findings, Utc::now());
+            let filtered = match maybe_apply_policy(findings, args) {
+                Ok(f) => f,
+                Err(McpKeyError::InvalidParam(msg)) => return rpc_error(req_id, -32602, &msg),
+                Err(McpKeyError::Runtime(msg)) => return rpc_result(req_id, tool_err(&msg)),
+            };
+            let report = Report::new(filtered, Utc::now());
             rpc_result(
                 req_id,
                 tool_ok(&serde_json::to_string_pretty(&report).unwrap_or_default()),
@@ -413,11 +460,194 @@ fn call_audit_docker(req_id: Value, args: &Map<String, Value>) -> Value {
     )
 }
 
+enum McpKeyError {
+    InvalidParam(String),
+    Runtime(String),
+}
+
+fn parse_workers_arg(args: &Map<String, Value>) -> Result<usize, String> {
+    match args.get("workers") {
+        None => Ok(default_worker_count()),
+        Some(v) => v
+            .as_u64()
+            .filter(|&n| n >= 1)
+            .map(|n| n as usize)
+            .ok_or_else(|| "Invalid params: 'workers' must be an integer >= 1".to_string()),
+    }
+}
+
+fn read_sign_key_env(args: &Map<String, Value>) -> Result<Option<Vec<u8>>, McpKeyError> {
+    let Some(val) = args.get("sign_key_env") else {
+        return Ok(None);
+    };
+    let Some(var_name) = val.as_str().map(str::trim).filter(|s| !s.is_empty()) else {
+        return Err(McpKeyError::InvalidParam(
+            "Invalid params: 'sign_key_env' must be a non-empty environment variable name"
+                .to_string(),
+        ));
+    };
+    let secret = std::env::var(var_name).map_err(|_| {
+        McpKeyError::Runtime(format!(
+            "signing key environment variable '{var_name}' is not set"
+        ))
+    })?;
+    if secret.is_empty() {
+        return Err(McpKeyError::Runtime(format!(
+            "signing key environment variable '{var_name}' is empty"
+        )));
+    }
+    Ok(Some(secret.into_bytes()))
+}
+
+fn maybe_apply_policy(
+    findings: Vec<Finding>,
+    args: &Map<String, Value>,
+) -> Result<Vec<Finding>, McpKeyError> {
+    let Some(val) = args.get("policy_path") else {
+        return Ok(findings);
+    };
+    let Some(path_str) = val.as_str().map(str::trim).filter(|s| !s.is_empty()) else {
+        return Err(McpKeyError::InvalidParam(
+            "Invalid params: 'policy_path' must be a non-empty string path".to_string(),
+        ));
+    };
+    let policy = load_policy(Path::new(path_str)).map_err(McpKeyError::Runtime)?;
+    Ok(apply_policy(findings, &policy, Utc::now().date_naive()).0)
+}
+
+fn call_audit_host(req_id: Value, args: &Map<String, Value>) -> Value {
+    let Some(kind_raw) = args.get("kind").and_then(|v| v.as_str()) else {
+        return rpc_error(
+            req_id,
+            -32602,
+            "Invalid params: missing string 'kind' (sysctl, sudoers, or permissions)",
+        );
+    };
+    let kind = kind_raw.trim().to_ascii_lowercase();
+    let path_opt = args.get("path").and_then(|v| v.as_str());
+    let content_opt = args.get("content").and_then(|v| v.as_str());
+    let label = args
+        .get("source_label")
+        .and_then(|v| v.as_str())
+        .unwrap_or("inline:host");
+
+    let findings = match (kind.as_str(), path_opt, content_opt) {
+        ("sysctl", Some(p), None) => match audit_sysctl_path(Path::new(p)) {
+            Ok(f) => f,
+            Err(err) => {
+                return rpc_result(
+                    req_id,
+                    tool_err(&format!("failed to audit sysctl '{p}': {err}")),
+                )
+            }
+        },
+        ("sysctl", None, Some(c)) => {
+            if c.len() > MAX_CONFIG_BYTES {
+                return rpc_error(
+                    req_id,
+                    -32602,
+                    &format!("Invalid params: 'content' exceeds {MAX_CONFIG_BYTES} byte limit"),
+                );
+            }
+            audit_sysctl_content(c, label)
+        }
+        ("sudoers", Some(p), None) => match audit_sudoers_path(Path::new(p)) {
+            Ok(f) => f,
+            Err(err) => {
+                return rpc_result(
+                    req_id,
+                    tool_err(&format!("failed to audit sudoers '{p}': {err}")),
+                )
+            }
+        },
+        ("sudoers", None, Some(c)) => {
+            if c.len() > MAX_CONFIG_BYTES {
+                return rpc_error(
+                    req_id,
+                    -32602,
+                    &format!("Invalid params: 'content' exceeds {MAX_CONFIG_BYTES} byte limit"),
+                );
+            }
+            audit_sudoers_content(c, label)
+        }
+        ("permissions", Some(p), None) => match audit_host_permissions_path(Path::new(p)) {
+            Ok(f) => f,
+            Err(err) => {
+                return rpc_result(
+                    req_id,
+                    tool_err(&format!("failed to audit permissions '{p}': {err}")),
+                )
+            }
+        },
+        ("permissions", None, Some(_)) => {
+            return rpc_error(
+                req_id,
+                -32602,
+                "Invalid params: kind 'permissions' requires filesystem 'path', not inline 'content'",
+            )
+        }
+        (other, Some(_), Some(_)) | (other, None, None) if matches!(other, "sysctl" | "sudoers" | "permissions") => {
+            return rpc_error(
+                req_id,
+                -32602,
+                "Invalid params: provide exactly one of 'path' or 'content'",
+            )
+        }
+        (other, _, _) => {
+            return rpc_error(
+                req_id,
+                -32602,
+                &format!("Invalid params: unsupported host kind '{other}' (expected sysctl, sudoers, or permissions)"),
+            )
+        }
+    };
+
+    let filtered = match maybe_apply_policy(findings, args) {
+        Ok(f) => f,
+        Err(McpKeyError::InvalidParam(msg)) => return rpc_error(req_id, -32602, &msg),
+        Err(McpKeyError::Runtime(msg)) => return rpc_result(req_id, tool_err(&msg)),
+    };
+
+    let report = Report::new(filtered, Utc::now());
+    rpc_result(
+        req_id,
+        tool_ok(&serde_json::to_string_pretty(&report).unwrap_or_default()),
+    )
+}
+
+fn call_audit_workspace(req_id: Value, args: &Map<String, Value>) -> Value {
+    let Some(path_str) = args.get("path").and_then(|v| v.as_str()) else {
+        return rpc_error(req_id, -32602, "Invalid params: missing string 'path'");
+    };
+
+    let findings = match audit_workspace(Path::new(path_str)) {
+        Ok(f) => f,
+        Err(err) => {
+            return rpc_result(
+                req_id,
+                tool_err(&format!("failed to audit workspace '{path_str}': {err}")),
+            )
+        }
+    };
+
+    let filtered = match maybe_apply_policy(findings, args) {
+        Ok(f) => f,
+        Err(McpKeyError::InvalidParam(msg)) => return rpc_error(req_id, -32602, &msg),
+        Err(McpKeyError::Runtime(msg)) => return rpc_result(req_id, tool_err(&msg)),
+    };
+
+    let report = Report::new(filtered, Utc::now());
+    rpc_result(
+        req_id,
+        tool_ok(&serde_json::to_string_pretty(&report).unwrap_or_default()),
+    )
+}
+
 fn tool_definitions() -> Value {
     json!([
         {
             "name": "hostguard_list_rules",
-            "description": "List all host hardening, FIM, SSH, and Docker CIS/MITRE D3FEND rules supported by raksa-hostguard.",
+            "description": "List all 24 host hardening, FIM, SSH, Docker, and Linux CIS/MITRE D3FEND rules supported by raksa-hostguard.",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -426,7 +656,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "hostguard_fim_snapshot",
-            "description": "Create a cryptographic SHA-256 baseline snapshot of host files or directories for later integrity verification.",
+            "description": "Create a cryptographic SHA-256 baseline snapshot (optionally HMAC-SHA256 signed via env var) of host files or directories.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -437,7 +667,7 @@ fn tool_definitions() -> Value {
                     },
                     "baseline_out": {
                         "type": "string",
-                        "description": "Output JSON file path where the signed snapshot structure will be written."
+                        "description": "Output JSON file path where the snapshot structure will be written."
                     },
                     "exclude": {
                         "type": "array",
@@ -448,6 +678,15 @@ fn tool_definitions() -> Value {
                         "type": "integer",
                         "minimum": 0,
                         "description": "Optional max file size cap in bytes (default 50 MiB; 0 uses default)."
+                    },
+                    "sign_key_env": {
+                        "type": "string",
+                        "description": "Optional environment variable name holding the HMAC-SHA256 key to sign the snapshot."
+                    },
+                    "workers": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional parallel worker thread count."
                     }
                 },
                 "required": ["paths", "baseline_out"],
@@ -456,13 +695,26 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "hostguard_fim_check",
-            "description": "Verify current filesystem state against a saved SHA-256 baseline snapshot and report content, deletion, addition, or permission drift.",
+            "description": "Verify current filesystem state against a saved SHA-256 baseline snapshot (and optional HMAC-SHA256 signature) and report drift.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "baseline_path": {
                         "type": "string",
                         "description": "Path to a baseline JSON file created by hostguard_fim_snapshot."
+                    },
+                    "sign_key_env": {
+                        "type": "string",
+                        "description": "Optional environment variable name holding the HMAC-SHA256 verification key."
+                    },
+                    "workers": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional parallel worker thread count."
+                    },
+                    "policy_path": {
+                        "type": "string",
+                        "description": "Optional YAML/JSON suppression policy path."
                     }
                 },
                 "required": ["baseline_path"],
@@ -471,7 +723,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "hostguard_audit_ssh",
-            "description": "Audit an OpenSSH sshd_config file or inline snippet against CIS Linux Benchmark SSH hardening rules (HOST-101 through HOST-104).",
+            "description": "Audit an OpenSSH sshd_config file (including drop-in Includes) or inline snippet against CIS Linux SSH rules (HOST-101 through HOST-106).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -484,7 +736,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "hostguard_audit_docker",
-            "description": "Audit a Dockerfile, docker-compose YAML file, directory tree, or inline container definition against CIS Docker Benchmark rules (HOST-201 through HOST-206) with automatic secret redaction.",
+            "description": "Audit a Dockerfile, docker-compose YAML file, directory tree, or inline container definition against CIS Docker rules (HOST-201 through HOST-209) with secret redaction.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -493,6 +745,39 @@ fn tool_definitions() -> Value {
                     "kind": { "type": "string", "enum": ["dockerfile", "compose"], "description": "Format when auditing inline content (default: dockerfile)." },
                     "source_label": { "type": "string", "description": "Optional label for inline findings." }
                 },
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "hostguard_audit_host",
+            "description": "Audit Linux sysctl configs, sudoers files, or host file permissions against CIS hardening rules (HOST-301 through HOST-304).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["sysctl", "sudoers", "permissions"],
+                        "description": "Host audit domain to execute."
+                    },
+                    "path": { "type": "string", "description": "File or directory path on disk." },
+                    "content": { "type": "string", "description": "Inline sysctl or sudoers config text (max 1 MiB)." },
+                    "source_label": { "type": "string", "description": "Optional label for inline findings." },
+                    "policy_path": { "type": "string", "description": "Optional YAML/JSON suppression policy path." }
+                },
+                "required": ["kind"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "hostguard_audit_workspace",
+            "description": "Recursively audit an entire repository or configuration directory across SSH, Docker/Compose, sysctl, and sudoers configs with optional policy suppression.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Workspace or directory path to scan." },
+                    "policy_path": { "type": "string", "description": "Optional YAML/JSON suppression policy path." }
+                },
+                "required": ["path"],
                 "additionalProperties": false
             }
         }
@@ -574,7 +859,7 @@ mod tests {
         let tools = responses[3]["result"]["tools"]
             .as_array()
             .expect("tools array");
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 7);
 
         let rules_text = responses[4]["result"]["content"][0]["text"]
             .as_str()
@@ -694,5 +979,119 @@ mod tests {
                 .unwrap();
         assert_eq!(tampered_report["summary"]["critical"], 1);
         assert_eq!(tampered_report["findings"][0]["rule_id"], "HOST-001");
+    }
+
+    #[test]
+    fn mcp_audit_host_and_workspace_with_policy() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("Dockerfile.insecure"),
+            "FROM ubuntu:latest\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("sysctl.conf"),
+            "net.ipv4.ip_forward = 1\nkernel.randomize_va_space = 0\n",
+        )
+        .unwrap();
+        let policy_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/policy_suppress.yml");
+
+        let sysctl_req = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "hostguard_audit_host",
+                "arguments": {
+                    "kind": "sysctl",
+                    "content": "net.ipv4.ip_forward = 1\nkernel.kptr_restrict = 0\n"
+                }
+            }
+        })
+        .to_string();
+
+        let sudoers_req = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "hostguard_audit_host",
+                "arguments": {
+                    "kind": "sudoers",
+                    "content": "deploy ALL=(ALL) NOPASSWD: ALL\n"
+                }
+            }
+        })
+        .to_string();
+
+        let ws_req = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "hostguard_audit_workspace",
+                "arguments": {
+                    "path": dir.path().to_string_lossy(),
+                    "policy_path": policy_path.to_string_lossy()
+                }
+            }
+        })
+        .to_string();
+
+        let bad_perms_req = json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "hostguard_audit_host",
+                "arguments": {
+                    "kind": "permissions",
+                    "content": "inline not supported"
+                }
+            }
+        })
+        .to_string();
+
+        let responses = run_rpc_session(&[&sysctl_req, &sudoers_req, &ws_req, &bad_perms_req]);
+        assert_eq!(responses.len(), 4);
+
+        let sysctl_rep: Value = serde_json::from_str(
+            responses[0]["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sysctl_rep["summary"]["high"], 2);
+
+        let sudo_rep: Value = serde_json::from_str(
+            responses[1]["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sudo_rep["findings"][0]["rule_id"], "HOST-304");
+
+        let ws_rep: Value = serde_json::from_str(
+            responses[2]["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let ws_rules: Vec<&str> = ws_rep["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["rule_id"].as_str().unwrap())
+            .collect();
+        // HOST-204 on Dockerfile.insecure was suppressed by testdata/policy_suppress.yml
+        assert!(
+            !ws_rules.contains(&"HOST-204"),
+            "policy should suppress HOST-204"
+        );
+        assert!(ws_rules.contains(&"HOST-201"));
+        assert!(ws_rules.contains(&"HOST-301"));
+
+        assert_eq!(responses[3]["error"]["code"], -32602);
     }
 }

@@ -198,7 +198,7 @@ fn cli_mcp_stdio_handshake_works() {
         .collect();
     assert_eq!(lines.len(), 2);
     assert_eq!(lines[0]["result"]["serverInfo"]["name"], "raksa-hostguard");
-    assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 5);
+    assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 7);
 }
 
 #[test]
