@@ -55,6 +55,16 @@ pub fn rule_catalog() -> Vec<RuleInfo> {
             description: "File mode bits or read-only attribute changed relative to the baseline snapshot.",
         },
         RuleInfo {
+            rule_id: "HOST-005",
+            title: "FIM baseline HMAC-SHA256 signature invalid or missing",
+            module: "fim",
+            default_severity: "critical",
+            mitre_d3fend: "D3-FIM",
+            mitre_technique: "File Integrity Monitoring",
+            cis_ref: "CIS Linux 6.1",
+            description: "Signed baseline verification failed because the HMAC-SHA256 tag is missing or no longer matches the snapshot payload.",
+        },
+        RuleInfo {
             rule_id: "HOST-101",
             title: "SSH root login enabled",
             module: "ssh-auditor",
@@ -93,6 +103,26 @@ pub fn rule_catalog() -> Vec<RuleInfo> {
             mitre_technique: "System User Configuration",
             cis_ref: "CIS Linux 5.2.5-5.2.7",
             description: "sshd_config enables X11Forwarding, sets MaxAuthTries above 4, or permits legacy Protocol 1.",
+        },
+        RuleInfo {
+            rule_id: "HOST-105",
+            title: "Weak or deprecated SSH cryptographic algorithms configured",
+            module: "ssh-auditor",
+            default_severity: "high",
+            mitre_d3fend: "D3-SUC",
+            mitre_technique: "System User Configuration",
+            cis_ref: "CIS Linux 5.2.13-5.2.15",
+            description: "sshd_config allows weak CBC/RC4/3DES ciphers, SHA-1/MD5 MACs, or legacy SHA-1 Diffie-Hellman key exchange.",
+        },
+        RuleInfo {
+            rule_id: "HOST-106",
+            title: "Weak SSH forwarding or idle session timeout policy",
+            module: "ssh-auditor",
+            default_severity: "medium",
+            mitre_d3fend: "D3-SUC",
+            mitre_technique: "System User Configuration",
+            cis_ref: "CIS Linux 5.2.16-5.2.19",
+            description: "sshd_config permits Agent/TCP forwarding, PermitUserEnvironment, or unbounded ClientAliveInterval.",
         },
         RuleInfo {
             rule_id: "HOST-201",
@@ -154,6 +184,76 @@ pub fn rule_catalog() -> Vec<RuleInfo> {
             cis_ref: "CIS Docker 4.9",
             description: "Dockerfile uses remote ADD URL or pipes curl/wget directly to a shell without verification.",
         },
+        RuleInfo {
+            rule_id: "HOST-207",
+            title: "Compose service missing no-new-privileges hardening",
+            module: "docker-auditor",
+            default_severity: "medium",
+            mitre_d3fend: "D3-LPM",
+            mitre_technique: "Local Privilege Management",
+            cis_ref: "CIS Docker 5.12 / 5.25",
+            description: "Compose service omits security_opt no-new-privileges:true to block privilege escalation via setuid binaries.",
+        },
+        RuleInfo {
+            rule_id: "HOST-208",
+            title: "Compose service omits cap_drop ALL or binds sensitive host path",
+            module: "docker-auditor",
+            default_severity: "medium",
+            mitre_d3fend: "D3-NI",
+            mitre_technique: "Network Isolation",
+            cis_ref: "CIS Docker 5.3 / 5.5",
+            description: "Compose service does not drop ALL Linux capabilities or bind-mounts sensitive host directories such as /etc or /proc.",
+        },
+        RuleInfo {
+            rule_id: "HOST-209",
+            title: "Container disables Seccomp/AppArmor or exposes sensitive port publicly",
+            module: "docker-auditor",
+            default_severity: "high",
+            mitre_d3fend: "D3-NI",
+            mitre_technique: "Network Isolation",
+            cis_ref: "CIS Docker 5.1 / 5.13 / 5.21",
+            description: "Compose service uses unconfined Seccomp/AppArmor profiles or binds sensitive ports on 0.0.0.0 without localhost restriction.",
+        },
+        RuleInfo {
+            rule_id: "HOST-301",
+            title: "Insecure kernel network sysctl parameter",
+            module: "host-auditor",
+            default_severity: "high",
+            mitre_d3fend: "D3-CH",
+            mitre_technique: "Configuration Hardening",
+            cis_ref: "CIS Linux 3.1-3.3",
+            description: "sysctl enables IP forwarding, ICMP redirects, or source routing, or disables SYN cookies and reverse-path filtering.",
+        },
+        RuleInfo {
+            rule_id: "HOST-302",
+            title: "Weak kernel memory or process protection sysctl parameter",
+            module: "host-auditor",
+            default_severity: "high",
+            mitre_d3fend: "D3-CH",
+            mitre_technique: "Configuration Hardening",
+            cis_ref: "CIS Linux 1.5.1-1.5.2",
+            description: "sysctl weakens ASLR, disables Yama ptrace_scope, allows kernel pointer/dmesg leaks, or permits suid core dumps.",
+        },
+        RuleInfo {
+            rule_id: "HOST-303",
+            title: "Overly permissive file mode, world-writable file, or unauthorized SUID/SGID",
+            module: "host-auditor",
+            default_severity: "critical",
+            mitre_d3fend: "D3-LPM",
+            mitre_technique: "Local Privilege Management",
+            cis_ref: "CIS Linux 6.1.2-6.1.9",
+            description: "Sensitive credential file allows group/world access, a file is world-writable, or SUID/SGID permission bits are set.",
+        },
+        RuleInfo {
+            rule_id: "HOST-304",
+            title: "Unrestricted passwordless sudoers rule",
+            module: "host-auditor",
+            default_severity: "high",
+            mitre_d3fend: "D3-SUC",
+            mitre_technique: "System User Configuration",
+            cis_ref: "CIS Linux 5.3.4",
+            description: "sudoers grants NOPASSWD ALL privileges or disables authentication via Defaults !authenticate.",
+        },
     ]
 }
 
@@ -163,9 +263,9 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn catalog_contains_14_unique_rules() {
+    fn catalog_contains_24_unique_rules() {
         let rules = rule_catalog();
-        assert_eq!(rules.len(), 14);
+        assert_eq!(rules.len(), 24);
         let mut seen = HashSet::new();
         for rule in rules {
             assert!(!rule.rule_id.is_empty());

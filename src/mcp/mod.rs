@@ -580,7 +580,7 @@ mod tests {
             .as_str()
             .expect("rules text");
         let rules: Value = serde_json::from_str(rules_text).expect("rules json");
-        assert_eq!(rules.as_array().expect("array").len(), 14);
+        assert_eq!(rules.as_array().expect("array").len(), 24);
 
         assert_eq!(responses[5]["error"]["code"], -32601);
         assert_eq!(responses[6]["error"]["code"], -32602);

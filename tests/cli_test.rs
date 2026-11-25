@@ -26,7 +26,7 @@ fn cli_version_and_rules_work() {
         .expect("run rules");
     assert_eq!(rules.status.code(), Some(0));
     let parsed: Value = serde_json::from_slice(&rules.stdout).expect("parse rules json");
-    assert_eq!(parsed.as_array().expect("rules array").len(), 14);
+    assert_eq!(parsed.as_array().expect("rules array").len(), 24);
 }
 
 #[test]
