@@ -2,6 +2,7 @@
 
 pub mod audit;
 pub mod fim;
+pub mod report;
 pub mod schema;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
