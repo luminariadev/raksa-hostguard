@@ -17,3 +17,7 @@ walkdir = "2"
 
 [dev-dependencies]
 tempfile = "3"
+
+[[bench]]
+name = "fim_throughput"
+harness = false
