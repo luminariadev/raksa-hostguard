@@ -5,6 +5,15 @@ All notable changes to `raksa-hostguard` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-11-26
+
+### Added
+- **Linux Host CIS Auditor (`audit-host` & `audit-workspace`)**: Audits kernel network sysctl hardening (`HOST-301`), memory/ptrace/dumpable protections (`HOST-302`), file permission/SUID/SGID/sensitive key exposures (`HOST-303`), and unrestricted `NOPASSWD` / `!authenticate` sudoers rules (`HOST-304`), plus recursive single-command `audit-workspace` triage across SSH, Docker, sysctl, and sudoers configs.
+- **Enterprise Signed & Parallel FIM (`fim init`, `fim check`, `fim watch`)**: Added pure safe Rust RFC 2104/4231 HMAC-SHA256 baseline signing (`--sign-key-env`, detecting forged or unsigned baselines as `HOST-005`), multi-threaded hashing/verification workers (`--workers`), and deduplicated polling watch mode (`fim watch`).
+- **Deeper SSH & Container Hardening Rules**: Added `Include` drop-in resolution (`<= 2` depth with cycle guard), weak SSH ciphers/MACs/Kex detection (`HOST-105`), forwarding/env/`ClientAliveInterval` checks (`HOST-106`), Compose `no-new-privileges` (`HOST-207`), `cap_drop: [ALL]` and sensitive host path mount guards (`HOST-208`), and unconfined Seccomp/AppArmor or wildcard sensitive port exposure detection (`HOST-209`).
+- **Suppression Policy Engine (`--policy`)**: Added YAML/JSON `.hostguard.yml` suppression support with mandatory audit reasons, `target_contains` scoping, `min_severity` filtering, and fail-closed `expires_on` expiration dates (`examples/hostguard-policy.yml`).
+- **MCP v0.2.0 Expansion**: Added `hostguard_audit_host` and `hostguard_audit_workspace` (7 total tools) plus optional `sign_key_env`, `workers`, and `policy_path` parameters on FIM/host tools.
+
 ## [0.1.0] - 2026-11-26
 
 ### Added

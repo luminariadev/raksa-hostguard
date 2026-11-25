@@ -5,64 +5,62 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org/)
 
-Defensive host hardening, File Integrity Monitoring (FIM), and Linux/Docker CIS configuration auditor written in pure safe Rust (`#![forbid(unsafe_code)]`).
+Defensive host hardening, signed File Integrity Monitoring (FIM), and Linux/SSH/Docker CIS configuration auditor written in pure safe Rust (`#![forbid(unsafe_code)]`).
 
-`raksa-hostguard` is **Layer 2 (`host-hardening`)** of the Raksa DevSecOps and Blue Team defense suite. It validates file integrity baselines, OpenSSH daemon settings, and container build/compose manifests offline, and outputs **Raksa Finding Schema v1** reports (`table`, `json`, `sarif` `2.1.0`) alongside a built-in `stdio` MCP server for automated security triage.
+`raksa-hostguard` is **Layer 2 (`host-hardening`)** of the Raksa DevSecOps and Blue Team defense suite. It provides parallel SHA-256 integrity baselines with HMAC-SHA256 tamper protection, audits OpenSSH (`Include`-aware + weak crypto), Docker/Compose (`no-new-privileges`, `cap_drop`, Seccomp, public ports), and Linux host configs (`sysctl`, `sudoers`, SUID/permissions), outputs **Raksa Finding Schema v1** (`table`, `json`, `sarif` `2.1.0`), and runs a `stdio` JSON-RPC 2.0 MCP server with 7 tools.
 
 ---
 
 ## Key Capabilities
 
-- **Streaming SHA-256 FIM (`fim init` / `fim check`)**: Hashes directories and files in fixed 64 KiB streaming buffers with symlink loop safety (`walkdir` non-following), configurable `--exclude` filters, and a 50 MiB default single-file guard. Detects content modification (`HOST-001`), deletion (`HOST-002`), unexpected additions (`HOST-003`), and permission drift (`HOST-004`).
-- **CIS OpenSSH Auditor (`audit-ssh`)**: Audits `sshd_config` directives (`PermitRootLogin`, `PasswordAuthentication`, `PermitEmptyPasswords`, `X11Forwarding`, `AllowAgentForwarding`, `AllowTcpForwarding`, `MaxAuthTries`) before reloading `sshd`.
-- **Multi-Stage Dockerfile & Compose Auditor (`audit-docker`)**: Evaluates final-stage non-root execution (allowing privileged builder stages when the final image drops privileges), `privileged: true` and `docker.sock` mounts, `network_mode: host` / `pid: host` / `SYS_ADMIN` / `ALL`, unpinned or `:latest` tags, unverified remote `ADD` URLs or `curl|sh` pipes, and hardcoded credential literals.
-- **Credential Redaction & Output Safety**: Secret-bearing environment/arg findings log only the variable name and line/service location (never plaintext secret values). Terminal `table` rendering strips ANSI/CSI/OSC escape sequences to protect operator consoles.
-- **Native MCP Server (`raksa-hostguard mcp`)**: Exposes 5 defensive inspection tools over newline-delimited `stdio` JSON-RPC 2.0 with a strict 1 MiB inline content cap.
+- **Parallel & HMAC-Signed FIM (`fim init` / `fim check` / `fim watch`)**: Multi-threaded streaming SHA-256 hashing (`std::thread::scope`, 64 KiB chunk buffers, symlink loop protection, 50 MiB file cap) with RFC 2104 HMAC-SHA256 baseline signing (`--sign-key-env`, detecting baseline tampering as `HOST-005`) and deduplicated polling watch mode (`fim watch`).
+- **CIS OpenSSH Auditor (`audit-ssh`)**: Resolves `Include` drop-ins (depth <= 2 with cycle guard) and audits authentication directives (`HOST-101`..`HOST-104`), weak CBC/RC4/3DES/SHA-1/MD5 ciphers, MACs, and Kex (`HOST-105`), plus forwarding, `PermitUserEnvironment`, and `ClientAliveInterval` (`HOST-106`).
+- **Multi-Stage Dockerfile & Compose Auditor (`audit-docker`)**: Checks final-stage non-root execution, `privileged: true` / `docker.sock`, host namespaces / `SYS_ADMIN`, unpinned/`:latest` images, secret literals (automatically redacted in reports), unverified `ADD`/`curl|sh`, `no-new-privileges:true` (`HOST-207`), `cap_drop: [ALL]` and sensitive host mounts (`HOST-208`), and unconfined Seccomp/AppArmor or public sensitive ports (`HOST-209`).
+- **Linux Host CIS & Workspace Auditor (`audit-host` / `audit-workspace`)**: Audits `sysctl` network and kernel protections (`HOST-301`, `HOST-302`), unsafe file modes / world-writable / SUID/SGID (`HOST-303`), and `NOPASSWD ALL` / `!authenticate` sudoers rules (`HOST-304`), or scans an entire repo/host tree in one pass via `audit-workspace`.
+- **Fail-Closed Suppression Policy (`--policy`)**: YAML/JSON policy files ([examples/hostguard-policy.yml](examples/hostguard-policy.yml)) support `min_severity`, `target_contains` scoping, mandatory audit reasons, and `expires_on` dates that automatically stop suppressing once expired.
+- **Native MCP Server (`raksa-hostguard mcp`)**: Exposes 7 defensive inspection tools over newline-delimited `stdio` JSON-RPC 2.0 with 1 MiB inline payload caps.
 
 ---
 
 ## Defensive Scope & Boundaries
 
-`raksa-hostguard` focuses strictly on **static configuration auditing and snapshot-based file integrity verification**. Understanding these boundaries helps teams avoid blind spots:
+`raksa-hostguard` focuses on **static configuration auditing, baseline integrity verification, and periodic polling**. Understanding these boundaries prevents blind spots:
 
-- **Snapshot vs. Continuous Kernel Monitoring**: `fim check` compares disk state against a saved JSON baseline on demand (for cron, systemd timers, or CI verification). It does **not** install kernel modules, eBPF probes, or `fanotify` daemons for real-time process blocking.
-- **Permission Granularity**: On POSIX/Linux targets, `HOST-004` records full octal permission modes (e.g., `0644`). On Windows NTFS hosts, Rust standard metadata exposes the read-only attribute rather than POSIX mode bits.
-- **Static Config vs. Runtime Daemon Inspection**: `audit-ssh` and `audit-docker` inspect configuration files statically. They do not connect to live Docker sockets or probe remote SSH ports (network exposure auditing lives in [raksa-netguard](https://github.com/luminariadev/raksa-netguard)).
-- **Heuristic Secret Detection**: `HOST-205` flags literal assignments to credential-named keys (ignoring `${VAR}` / `$VAR` interpolation), and is not a replacement for dedicated git history secret scanners.
+- **Periodic Watch vs. Kernel Inline Blocking**: `fim watch` verifies integrity periodically on a polling interval without loading kernel modules or eBPF probes. It detects tampering quickly but does not block syscalls inline.
+- **Cross-Platform Permissions (`HOST-004` / `HOST-303`)**: On Linux/Unix targets, both octal permissions (`0600`, `4755`) and SUID/SGID/world-writable bits are checked. On Windows NTFS hosts, `audit-host --perms` skips Unix octal mode checks and `HOST-004` tracks read-only attribute changes.
+- **Static Config vs. Live Network Exposure**: Static SSH/Docker/sysctl checks do not probe live TCP sockets (live network exposure detection belongs in Layer 1, [raksa-netguard](https://github.com/luminariadev/raksa-netguard)).
 
 ---
 
 ## Architecture
 
 ```text
-+-------------------------------------------------------------------------+
-|                       CLI & stdio MCP Entrypoint                        |
-|   fim init | fim check | audit-ssh | audit-docker | rules | mcp         |
-+------+-------------------+--------------------+-------------------+-----+
-       |                   |                    |                   |
-       v                   v                    v                   v
-+--------------+   +---------------+   +----------------+   +-------------+
-| FIM Engine   |   | SSH Auditor   |   | Docker/Compose |   | Rule Catalog|
-| 64 KiB SHA256|   | CIS 5.2.x     |   | CIS 4.x / 5.x  |   | 14 HOST-*   |
-+------+-------+   +-------+-------+   +--------+-------+   +-------------+
-       |                   |                    |
-       +-------------------+--------------------+
-                           |
-                           v
-       +---------------------------------------+
-       |        Raksa Finding Schema v1        |
-       |  Summary + Severity Gate (--fail-on)  |
-       +-------------------+-------------------+
-                           |
-        +------------------+------------------+
-        v                  v                  v
-+---------------+  +---------------+  +---------------+
-| Table Output  |  | JSON Schema 1 |  | SARIF 2.1.0   |
-| ANSI-Sanitized|  | Automation    |  | GitHub SecOps |
-+---------------+  +---------------+  +---------------+
++---------------------------------------------------------------------------------+
+|                         CLI & stdio MCP Entrypoint                              |
+|  fim init|check|watch | audit-ssh | audit-docker | audit-host | audit-workspace |
++--------+-----------------+----------------+---------------+---------------------+
+         |                 |                |               |
+         v                 v                v               v
++----------------+ +---------------+ +---------------+ +--------------------------+
+| Parallel FIM   | | SSH Auditor   | | Docker/Compose| | Host Auditor             |
+| + HMAC-SHA256  | | + Include/Kex | | + Cap/Seccomp | | sysctl + sudoers + perms |
++--------+-------+ +-------+-------+ +-------+-------+ +-------------+------------+
+         |                 |                 |                       |
+         +-----------------+--------+--------+-----------------------+
+                                    |
+                                    v
+                     +------------------------------+
+                     |  Policy Filter (--policy)    |
+                     +--------------+---------------+
+                                    |
+                                    v
+                     +------------------------------+
+                     | Raksa Finding Schema v1      |
+                     | Table | JSON | SARIF 2.1.0   |
+                     +------------------------------+
 ```
 
-See [docs/architecture.md](docs/architecture.md) and [docs/threat-model.md](docs/threat-model.md) for detailed design and security controls.
+See [docs/architecture.md](docs/architecture.md) and [docs/threat-model.md](docs/threat-model.md) for module details and trust boundaries.
 
 ---
 
@@ -70,7 +68,7 @@ See [docs/architecture.md](docs/architecture.md) and [docs/threat-model.md](docs
 
 ### 1. Prebuilt Release Binaries
 
-Download the archive for Linux (`x86_64-unknown-linux-musl`), Windows (`x86_64-pc-windows-msvc`), or macOS (`aarch64-apple-darwin`) along with `SHA256SUMS.txt` from [GitHub Releases](https://github.com/luminariadev/raksa-hostguard/releases).
+Download archives for Linux (`x86_64-unknown-linux-musl`), Windows (`x86_64-pc-windows-msvc`), or macOS (`aarch64-apple-darwin`) and `SHA256SUMS.txt` from [GitHub Releases](https://github.com/luminariadev/raksa-hostguard/releases).
 
 ### 2. Build from Source (Rust 1.80+)
 
@@ -83,8 +81,8 @@ cargo install --path . --locked
 ### 3. Container Image (Distroless Non-Root)
 
 ```bash
-docker build -t raksa-hostguard:v0.1.0 .
-docker run --rm raksa-hostguard:v0.1.0 version
+docker build -t raksa-hostguard:v0.2.0 .
+docker run --rm raksa-hostguard:v0.2.0 version
 ```
 
 ---
@@ -95,101 +93,108 @@ docker run --rm raksa-hostguard:v0.1.0 version
 
 ```bash
 raksa-hostguard version
-# raksa-hostguard v0.1.0 (schema 1.0, layer host-hardening)
+# raksa-hostguard v0.2.0 (schema 1.0, layer host-hardening)
 
 raksa-hostguard rules
 ```
 
-### Audit OpenSSH Configuration
+### Audit Linux Host Kernel & Sudoers (`audit-host`)
 
 ```bash
-raksa-hostguard audit-ssh --path testdata/sshd_insecure.conf --fail-on high
+raksa-hostguard audit-host \
+  --sysctl testdata/sysctl_insecure.conf \
+  --sudoers testdata/sudoers_insecure \
+  --fail-on high
 ```
 
-Verified output (`exit 2` because `--fail-on high` threshold is breached):
+Verified output (`exit 2`):
 
 ```text
-raksa-hostguard v0.1.0 | layer: host-hardening | total: 5 (critical: 1, high: 2, medium: 2, low: 0, info: 0)
+raksa-hostguard v0.2.0 | layer: host-hardening | total: 11 (critical: 0, high: 11, medium: 0, low: 0, info: 0)
 SEVERITY  RULE       MODULE          TARGET                               TITLE
 ----------------------------------------------------------------------------------------------------
-HIGH      HOST-101   ssh-auditor     file://testdata/sshd_insecure.conf   SSH root login enabled
-          fix: Set 'PermitRootLogin no' (or 'prohibit-password' if strictly required) and reload sshd.
-HIGH      HOST-102   ssh-auditor     file://testdata/sshd_insecure.conf   SSH password authentication enabled
-          fix: Set 'PasswordAuthentication no' and require SSH public-key or certificate authentication.
-CRITICAL  HOST-103   ssh-auditor     file://testdata/sshd_insecure.conf   SSH empty passwords permitted
-          fix: Set 'PermitEmptyPasswords no' immediately and reload sshd.
-MEDIUM    HOST-104   ssh-auditor     file://testdata/sshd_insecure.conf   SSH X11 forwarding enabled
-          fix: Set 'X11Forwarding no' unless interactive graphical forwarding is explicitly required.
-MEDIUM    HOST-104   ssh-auditor     file://testdata/sshd_insecure.conf   SSH MaxAuthTries exceeds CIS threshold
-          fix: Set 'MaxAuthTries 4' or lower to restrict password/key brute-force attempts per connection.
+HIGH      HOST-302   host-auditor    file://testdata/sysctl_insecure.conf Weak kernel memory or process protection sysctl parameter
+          fix: Set fs.suid_dumpable = 0 to prevent privileged binaries from writing core dumps containing secrets.
+HIGH      HOST-302   host-auditor    file://testdata/sysctl_insecure.conf Weak kernel memory or process protection sysctl parameter
+          fix: Set kernel.kptr_restrict = 1 (or 2 for strict isolation) in /etc/sysctl.d/.
+HIGH      HOST-302   host-auditor    file://testdata/sysctl_insecure.conf Weak kernel memory or process protection sysctl parameter
+          fix: Set kernel.randomize_va_space = 2 to enforce full Address Space Layout Randomization.
+HIGH      HOST-301   host-auditor    file://testdata/sysctl_insecure.conf Insecure kernel network sysctl parameter
+          fix: Set net.ipv4.ip_forward = 0 unless this host acts as a dedicated router/container bridge.
+HIGH      HOST-304   host-auditor    file://testdata/sudoers_insecure     Unrestricted passwordless sudoers rule
+          fix: Remove !authenticate from sudoers Defaults to require authentication for privilege escalation.
 ```
 
-### Audit Dockerfiles & Compose Manifests (with Secret Redaction)
+### Workspace Audit with Suppression Policy (`audit-workspace`)
 
 ```bash
-raksa-hostguard audit-docker --path testdata/Dockerfile.insecure --fail-on medium
+raksa-hostguard audit-workspace \
+  --path testdata \
+  --policy testdata/policy_suppress.yml \
+  --fail-on critical
 ```
 
-Verified output (`exit 2`, literal passwords/tokens redacted):
+Verified output (`exit 2`, `HOST-204` on `Dockerfile.insecure` suppressed by active policy):
 
 ```text
-raksa-hostguard v0.1.0 | layer: host-hardening | total: 6 (critical: 0, high: 3, medium: 3, low: 0, info: 0)
-SEVERITY  RULE       MODULE          TARGET                               TITLE
-----------------------------------------------------------------------------------------------------
-MEDIUM    HOST-204   docker-auditor  file://testdata/Dockerfile.insecure  Unpinned or :latest container image tag
-          fix: Pin the base image to an explicit version tag or @sha256 digest.
-HIGH      HOST-205   docker-auditor  file://testdata/Dockerfile.insecure  Hardcoded secret literal in container environment
-          fix: Remove literal secrets from Dockerfile; pass credentials at runtime via secret mounts or CI secrets.
-HIGH      HOST-205   docker-auditor  file://testdata/Dockerfile.insecure  Hardcoded secret literal in container environment
-          fix: Remove literal secrets from Dockerfile; pass credentials at runtime via secret mounts or CI secrets.
-MEDIUM    HOST-206   docker-auditor  file://testdata/Dockerfile.insecure  Unverified remote artifact fetch in Dockerfile
-          fix: Prefer COPY from a verified build stage or download with explicit SHA-256 verification.
-MEDIUM    HOST-206   docker-auditor  file://testdata/Dockerfile.insecure  Unverified remote artifact fetch in Dockerfile
-          fix: Download remote scripts first, verify SHA-256 checksums, and avoid piping directly to sh/bash.
-HIGH      HOST-201   docker-auditor  file://testdata/Dockerfile.insecure  Container configured to run as root
-          fix: Add a dedicated non-root USER instruction (e.g., USER nonroot or UID >= 1000) in the final stage.
+raksa-hostguard v0.2.0 | layer: host-hardening | total: 43 (critical: 3, high: 26, medium: 14, low: 0, info: 0)
 ```
 
-Running against the distroless image directly:
+### Audit OpenSSH & Docker (`audit-ssh` / `audit-docker`)
+
+```bash
+raksa-hostguard audit-ssh --path testdata/sshd_weak_crypto.conf --fail-on high
+raksa-hostguard audit-docker --path testdata/docker-compose.unconfined.yml --fail-on high
+```
+
+Running directly inside the distroless Docker image:
 
 ```bash
 docker run --rm -v "$(pwd)/testdata:/testdata:ro" \
-  raksa-hostguard:v0.1.0 audit-docker --path /testdata/Dockerfile.insecure --fail-on medium
+  raksa-hostguard:v0.2.0 audit-host \
+  --sysctl /testdata/sysctl_insecure.conf \
+  --sudoers /testdata/sudoers_insecure \
+  --fail-on high
 ```
 
-### File Integrity Monitoring (FIM) Baseline & Verification
+### Signed & Parallel FIM (`fim init` / `fim check` / `fim watch`)
 
 ```bash
-# 1. Create baseline snapshot
-raksa-hostguard fim init --path /etc/ssh --out ssh-baseline.json
+export RAKSA_FIM_KEY="replace-with-random-256-bit-secret"
 
-# 2. Verify filesystem state against baseline (exit 0 when clean, exit 2 on threshold breach)
-raksa-hostguard fim check --baseline ssh-baseline.json --fail-on critical
+# 1. Create a signed baseline using parallel worker threads
+raksa-hostguard fim init --path /etc/ssh --out ssh-baseline.json --sign-key-env RAKSA_FIM_KEY
+
+# 2. Verify integrity and baseline authenticity (exit 2 + HOST-005 if baseline was tampered)
+raksa-hostguard fim check --baseline ssh-baseline.json --sign-key-env RAKSA_FIM_KEY --fail-on critical
+
+# 3. Monitor continuously with deduplicated drift alerts
+raksa-hostguard fim watch --baseline ssh-baseline.json --interval-secs 10 --sign-key-env RAKSA_FIM_KEY
 ```
 
-Verified drift detection output when a monitored `hosts` file is altered:
+Verified output when a signed baseline signature is modified (`HOST-005`, `exit 2`):
 
 ```text
-FIM baseline created: .../baseline.json
+FIM baseline created: .../signed.json (signed: true)
   files hashed: 1 | total bytes: 21 | skipped oversize: 0 | skipped unreadable: 0
-raksa-hostguard v0.1.0 | layer: host-hardening | total: 1 (critical: 1, high: 0, medium: 0, low: 0, info: 0)
+raksa-hostguard v0.2.0 | layer: host-hardening | total: 1 (critical: 1, high: 0, medium: 0, low: 0, info: 0)
 SEVERITY  RULE       MODULE          TARGET                               TITLE
 ----------------------------------------------------------------------------------------------------
-CRITICAL  HOST-001   fim             file://.../etc/hosts                 Monitored file content modified
-          fix: Inspect recent changes to .../etc/hosts; restore from a verified artifact if unauthorized.
+CRITICAL  HOST-005   fim             baseline://snapshot                  FIM baseline HMAC-SHA256 signature invalid or missing
+          fix: Re-verify the baseline against a trusted offline copy or regenerate it with 'fim init --sign-key-env ...'.
 ```
 
 ---
 
 ## CI/CD SARIF Integration
 
-Export findings in **SARIF 2.1.0** for GitHub Code Scanning alongside an automated severity gate (`exit 2` stops the pipeline cleanly on findings at or above `--fail-on`, while runtime errors return `exit 1`):
+Export findings in **SARIF 2.1.0** for GitHub Code Scanning with `--policy` and `--fail-on` severity gating:
 
 ```yaml
-- name: Run raksa-hostguard container audit
+- name: Run raksa-hostguard workspace audit
   run: |
     set +e
-    raksa-hostguard audit-docker --path . --format sarif --output hostguard.sarif --fail-on high
+    raksa-hostguard audit-workspace --path . --policy .hostguard.yml --format sarif --output hostguard.sarif --fail-on high
     rc=$?
     set -e
     if [ "$rc" -eq 1 ]; then exit 1; fi
@@ -204,7 +209,7 @@ Export findings in **SARIF 2.1.0** for GitHub Code Scanning alongside an automat
 
 ## MCP Integration
 
-`raksa-hostguard` implements a local Model Context Protocol (MCP) server over `stdio` JSON-RPC 2.0 so MCP-compatible clients and agents can audit host configs, run FIM checks, and inspect rule remediation directly.
+`raksa-hostguard mcp` exposes 7 tools over `stdio` JSON-RPC 2.0 so MCP-compatible clients and agents can inspect workspaces, sysctl/sudoers configs, SSH/Docker manifests, and signed FIM baselines:
 
 ```json
 {
@@ -218,28 +223,32 @@ Export findings in **SARIF 2.1.0** for GitHub Code Scanning alongside an automat
 ```
 
 Available MCP tools:
-- `hostguard_list_rules`: Return the full catalog of 14 `HOST-*` rules with CIS and MITRE D3FEND metadata.
-- `hostguard_fim_snapshot`: Build and write a SHA-256 baseline JSON snapshot for specified host directories.
-- `hostguard_fim_check`: Verify disk state against a saved baseline and return Raksa Schema v1 findings.
-- `hostguard_audit_ssh`: Audit an `sshd_config` file path or inline text (max 1 MiB).
-- `hostguard_audit_docker`: Audit a Dockerfile, Compose file, directory tree, or inline container config (max 1 MiB).
+- `hostguard_list_rules`: Return all 24 `HOST-*` rules with CIS and MITRE D3FEND metadata.
+- `hostguard_fim_snapshot`: Build a SHA-256 baseline JSON snapshot (optional `workers`, `sign_key_env`).
+- `hostguard_fim_check`: Verify disk state and optional HMAC signature (optional `workers`, `sign_key_env`, `policy_path`).
+- `hostguard_audit_ssh`: Audit `sshd_config` files (with `Include` resolution) or inline text (max 1 MiB).
+- `hostguard_audit_docker`: Audit Dockerfiles, Compose files, directories, or inline container config (max 1 MiB).
+- `hostguard_audit_host`: Audit `sysctl`, `sudoers`, or host `permissions` (with optional `policy_path`).
+- `hostguard_audit_workspace`: Recursively audit a full workspace across SSH, Docker, sysctl, and sudoers (with optional `policy_path`).
 
 ---
 
 ## Benchmarks
 
-Measured with `cargo bench --locked` (release profile, Windows `x86_64`, 200 files totaling 16.00 MiB across 5 iterations for FIM, and 5,000 to 10,000 iterations for parsers):
+Measured with `cargo bench --locked` (`v0.2.0` release profile, Windows `x86_64`, `workers=8`, 200 files totaling 16.00 MiB across 5 iterations for FIM, and 5,000 to 10,000 iterations for config auditors):
 
 | Benchmark | Workload | Elapsed | Throughput |
 | :--- | :--- | :--- | :--- |
-| `fim_create_snapshot` | 200 files (16.00 MiB) x 5 | 0.1372s | 7,290.8 files/s (583.26 MiB/s) |
-| `fim_verify_snapshot` | 200 files (16.00 MiB) x 5 | 0.1483s | 6,741.1 files/s (539.29 MiB/s) |
-| `audit_dockerfile` | 10,000 multi-stage parses | 0.0600s | 166,721.4 ops/s |
-| `audit_compose` | 5,000 YAML compose parses | 0.0740s | 67,596.2 ops/s |
+| `fim_create_snapshot_1w` | 200 files (16.00 MiB) x 5, 1 worker | 0.1171s | 8,536.9 files/s (682.95 MiB/s) |
+| `fim_create_snapshot_parallel` | 200 files (16.00 MiB) x 5, 8 workers | 0.0313s | 31,984.4 files/s (2,558.76 MiB/s) |
+| `fim_verify_snapshot_parallel` | 200 files (16.00 MiB) x 5, 8 workers | 0.0370s | 27,037.1 files/s (2,162.97 MiB/s) |
+| `audit_dockerfile` | 10,000 multi-stage parses | 0.0623s | 160,420.7 ops/s |
+| `audit_compose` | 5,000 YAML compose parses | 0.0859s | 58,235.1 ops/s |
+| `audit_sysctl` | 10,000 sysctl config parses | 0.0286s | 349,592.9 ops/s |
 
 ---
 
-## Rule Catalog (CIS & MITRE D3FEND)
+## Rule Catalog (24 CIS & MITRE D3FEND Rules)
 
 | Rule ID | Severity | Module | CIS Reference | MITRE D3FEND | Title |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -247,16 +256,26 @@ Measured with `cargo bench --locked` (release profile, Windows `x86_64`, 200 fil
 | `HOST-002` | High | `fim` | CIS Linux 6.1 | `D3-FIM` | Monitored file deleted |
 | `HOST-003` | Medium | `fim` | CIS Linux 6.1 | `D3-FIM` | Unexpected file added in monitored directory |
 | `HOST-004` | High | `fim` | CIS Linux 6.1 | `D3-FIM` | Monitored file permissions changed |
+| `HOST-005` | Critical | `fim` | CIS Linux 6.1 | `D3-FIM` | FIM baseline HMAC-SHA256 signature invalid or missing |
 | `HOST-101` | High | `ssh-auditor` | CIS Linux 5.2.8 | `D3-SUC` | SSH root login enabled |
 | `HOST-102` | High | `ssh-auditor` | CIS Linux 5.2.12 | `D3-SUC` | SSH password authentication enabled |
 | `HOST-103` | Critical | `ssh-auditor` | CIS Linux 5.2.9 | `D3-SUC` | SSH empty passwords permitted |
 | `HOST-104` | Medium | `ssh-auditor` | CIS Linux 5.2.5-5.2.7 | `D3-SUC` | Weak SSH session hardening setting |
+| `HOST-105` | High | `ssh-auditor` | CIS Linux 5.2.13-5.2.15 | `D3-SUC` | Weak or deprecated SSH cryptographic algorithms configured |
+| `HOST-106` | Medium | `ssh-auditor` | CIS Linux 5.2.16-5.2.19 | `D3-SUC` | Weak SSH forwarding or idle session timeout policy |
 | `HOST-201` | High | `docker-auditor` | CIS Docker 4.1 | `D3-LPM` | Container configured to run as root |
 | `HOST-202` | Critical | `docker-auditor` | CIS Docker 5.4 / 5.31 | `D3-LPM` | Privileged container or Docker socket mount |
 | `HOST-203` | High | `docker-auditor` | CIS Docker 5.3 / 5.9 / 5.15 | `D3-NI` | Host namespace sharing or dangerous Linux capabilities |
 | `HOST-204` | Medium | `docker-auditor` | CIS Docker 4.7 | `D3-SPP` | Unpinned or `:latest` container image tag |
 | `HOST-205` | High | `docker-auditor` | CIS Docker 4.10 | `D3-SM` | Hardcoded secret literal in container environment |
 | `HOST-206` | Medium | `docker-auditor` | CIS Docker 4.9 | `D3-SPP` | Unverified remote artifact fetch in Dockerfile |
+| `HOST-207` | Medium | `docker-auditor` | CIS Docker 5.12 / 5.25 | `D3-LPM` | Compose service missing no-new-privileges hardening |
+| `HOST-208` | Medium | `docker-auditor` | CIS Docker 5.3 / 5.5 | `D3-NI` | Compose service omits cap_drop ALL or binds sensitive host path |
+| `HOST-209` | High | `docker-auditor` | CIS Docker 5.1 / 5.13 / 5.21 | `D3-NI` | Container disables Seccomp/AppArmor or exposes sensitive port publicly |
+| `HOST-301` | High | `host-auditor` | CIS Linux 3.1-3.3 | `D3-CH` | Insecure kernel network sysctl parameter |
+| `HOST-302` | High | `host-auditor` | CIS Linux 1.5.1-1.5.2 | `D3-CH` | Weak kernel memory or process protection sysctl parameter |
+| `HOST-303` | Critical | `host-auditor` | CIS Linux 6.1.2-6.1.9 | `D3-LPM` | Overly permissive file mode, world-writable file, or unauthorized SUID/SGID |
+| `HOST-304` | High | `host-auditor` | CIS Linux 5.3.4 | `D3-SUC` | Unrestricted passwordless sudoers rule |
 
 ---
 
