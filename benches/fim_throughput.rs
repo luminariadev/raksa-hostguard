@@ -1,6 +1,9 @@
 use raksa_hostguard::audit::docker::{audit_compose, audit_dockerfile};
+use raksa_hostguard::audit::host::audit_sysctl_content;
 use raksa_hostguard::fim::hash::DEFAULT_MAX_FILE_BYTES;
-use raksa_hostguard::fim::{create_snapshot, verify_snapshot};
+use raksa_hostguard::fim::{
+    create_snapshot_with_workers, default_worker_count, verify_snapshot_with_workers,
+};
 use std::fs;
 use std::hint::black_box;
 use std::path::PathBuf;
@@ -24,7 +27,6 @@ fn main() {
             base_chunk
         };
         let mut payload = vec![b'A' + (idx % 26) as u8; len];
-        // Inject variation across blocks so buffers are distinct.
         if len > 16 {
             payload[0] = (idx & 0xff) as u8;
             payload[len - 1] = ((idx * 7) & 0xff) as u8;
@@ -36,34 +38,41 @@ fn main() {
     let roots = vec![PathBuf::from(&root)];
     let excludes: Vec<String> = Vec::new();
     let total_mib = total_target_bytes as f64 / (1024.0 * 1024.0);
-
-    // Warmup pass for create_snapshot and capture baseline.
-    let (baseline, _) =
-        create_snapshot(&roots, &excludes, DEFAULT_MAX_FILE_BYTES).expect("warmup create_snapshot");
-
+    let workers = default_worker_count();
     let fim_iters = 5u32;
-    let t_snap = Instant::now();
+
+    // Single-worker create_snapshot
+    let (baseline, _) = create_snapshot_with_workers(&roots, &excludes, DEFAULT_MAX_FILE_BYTES, 1)
+        .expect("warmup 1w snapshot");
+    let t_snap_1w = Instant::now();
     for _ in 0..fim_iters {
-        let res = create_snapshot(&roots, &excludes, DEFAULT_MAX_FILE_BYTES)
-            .expect("bench create_snapshot");
+        let res = create_snapshot_with_workers(&roots, &excludes, DEFAULT_MAX_FILE_BYTES, 1)
+            .expect("bench 1w create_snapshot");
         black_box(res);
     }
-    let snap_elapsed = t_snap.elapsed().as_secs_f64();
-    let snap_files_per_sec = (file_count as f64 * f64::from(fim_iters)) / snap_elapsed;
-    let snap_mib_per_sec = (total_mib * f64::from(fim_iters)) / snap_elapsed;
+    let snap_1w_elapsed = t_snap_1w.elapsed().as_secs_f64();
 
-    // Warmup verify_snapshot.
-    let _ = verify_snapshot(&baseline).expect("warmup verify_snapshot");
+    // Multi-worker parallel create_snapshot
+    let _ = create_snapshot_with_workers(&roots, &excludes, DEFAULT_MAX_FILE_BYTES, workers)
+        .expect("warmup parallel snapshot");
+    let t_snap_par = Instant::now();
+    for _ in 0..fim_iters {
+        let res = create_snapshot_with_workers(&roots, &excludes, DEFAULT_MAX_FILE_BYTES, workers)
+            .expect("bench parallel create_snapshot");
+        black_box(res);
+    }
+    let snap_par_elapsed = t_snap_par.elapsed().as_secs_f64();
 
+    // Multi-worker parallel verify_snapshot
+    let _ = verify_snapshot_with_workers(&baseline, workers).expect("warmup parallel verify");
     let t_verify = Instant::now();
     for _ in 0..fim_iters {
-        let findings = verify_snapshot(&baseline).expect("bench verify_snapshot");
+        let findings =
+            verify_snapshot_with_workers(&baseline, workers).expect("bench verify_snapshot");
         assert!(findings.is_empty());
         black_box(findings);
     }
     let verify_elapsed = t_verify.elapsed().as_secs_f64();
-    let verify_files_per_sec = (file_count as f64 * f64::from(fim_iters)) / verify_elapsed;
-    let verify_mib_per_sec = (total_mib * f64::from(fim_iters)) / verify_elapsed;
 
     let dockerfile_sample = "\
 FROM rust:1.86-alpine AS builder
@@ -82,7 +91,6 @@ USER nonroot
         black_box(f);
     }
     let df_elapsed = t_df.elapsed().as_secs_f64();
-    let df_ops_per_sec = f64::from(df_iters) / df_elapsed;
 
     let compose_sample = "\
 services:
@@ -91,6 +99,8 @@ services:
     user: \"1000:1000\"
     cap_drop:
       - ALL
+    security_opt:
+      - no-new-privileges:true
     environment:
       APP_ENV: production
       API_TOKEN: ${API_TOKEN}
@@ -102,23 +112,71 @@ services:
         black_box(f);
     }
     let cmp_elapsed = t_cmp.elapsed().as_secs_f64();
-    let cmp_ops_per_sec = f64::from(cmp_iters) / cmp_elapsed;
 
-    println!("raksa-hostguard v{} benchmark", raksa_hostguard::VERSION);
+    let sysctl_sample = "\
+net.ipv4.ip_forward = 0
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.tcp_syncookies = 1
+kernel.randomize_va_space = 2
+kernel.yama.ptrace_scope = 1
+fs.suid_dumpable = 0
+";
+    let sysctl_iters = 10_000u32;
+    let t_sysctl = Instant::now();
+    for _ in 0..sysctl_iters {
+        let f = audit_sysctl_content(black_box(sysctl_sample), "bench-sysctl.conf");
+        black_box(f);
+    }
+    let sysctl_elapsed = t_sysctl.elapsed().as_secs_f64();
+
     println!(
-        "fim_create_snapshot  : {} files ({:.2} MiB) x {} | {:.4}s | {:.1} files/s | {:.2} MiB/s",
-        file_count, total_mib, fim_iters, snap_elapsed, snap_files_per_sec, snap_mib_per_sec
+        "raksa-hostguard v{} benchmark (workers={})",
+        raksa_hostguard::VERSION,
+        workers
     );
     println!(
-        "fim_verify_snapshot  : {} files ({:.2} MiB) x {} | {:.4}s | {:.1} files/s | {:.2} MiB/s",
-        file_count, total_mib, fim_iters, verify_elapsed, verify_files_per_sec, verify_mib_per_sec
+        "fim_create_snapshot_1w       : {} files ({:.2} MiB) x {} | {:.4}s | {:.1} files/s | {:.2} MiB/s",
+        file_count,
+        total_mib,
+        fim_iters,
+        snap_1w_elapsed,
+        (file_count as f64 * f64::from(fim_iters)) / snap_1w_elapsed,
+        (total_mib * f64::from(fim_iters)) / snap_1w_elapsed
     );
     println!(
-        "audit_dockerfile     : {} iters | {:.4}s | {:.1} ops/s",
-        df_iters, df_elapsed, df_ops_per_sec
+        "fim_create_snapshot_parallel : {} files ({:.2} MiB) x {} | {:.4}s | {:.1} files/s | {:.2} MiB/s",
+        file_count,
+        total_mib,
+        fim_iters,
+        snap_par_elapsed,
+        (file_count as f64 * f64::from(fim_iters)) / snap_par_elapsed,
+        (total_mib * f64::from(fim_iters)) / snap_par_elapsed
     );
     println!(
-        "audit_compose        : {} iters | {:.4}s | {:.1} ops/s",
-        cmp_iters, cmp_elapsed, cmp_ops_per_sec
+        "fim_verify_snapshot_parallel : {} files ({:.2} MiB) x {} | {:.4}s | {:.1} files/s | {:.2} MiB/s",
+        file_count,
+        total_mib,
+        fim_iters,
+        verify_elapsed,
+        (file_count as f64 * f64::from(fim_iters)) / verify_elapsed,
+        (total_mib * f64::from(fim_iters)) / verify_elapsed
+    );
+    println!(
+        "audit_dockerfile             : {} iters | {:.4}s | {:.1} ops/s",
+        df_iters,
+        df_elapsed,
+        f64::from(df_iters) / df_elapsed
+    );
+    println!(
+        "audit_compose                : {} iters | {:.4}s | {:.1} ops/s",
+        cmp_iters,
+        cmp_elapsed,
+        f64::from(cmp_iters) / cmp_elapsed
+    );
+    println!(
+        "audit_sysctl                 : {} iters | {:.4}s | {:.1} ops/s",
+        sysctl_iters,
+        sysctl_elapsed,
+        f64::from(sysctl_iters) / sysctl_elapsed
     );
 }
