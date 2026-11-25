@@ -22,11 +22,7 @@ pub fn serve_stdio() -> io::Result<()> {
 }
 
 pub fn serve_streams<R: BufRead, W: Write>(mut reader: R, mut writer: W) -> io::Result<()> {
-    loop {
-        let Some(line) = read_bounded_line(&mut reader, MAX_RPC_LINE_BYTES)? else {
-            break;
-        };
-
+    while let Some(line) = read_bounded_line(&mut reader, MAX_RPC_LINE_BYTES)? {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -117,9 +113,7 @@ fn handle_request(req: &Value) -> Option<Value> {
     };
 
     // Notifications omit id and do not receive a JSON-RPC response.
-    let Some(req_id) = id else {
-        return None;
-    };
+    let req_id = id?;
 
     let params = obj
         .get("params")

@@ -186,28 +186,26 @@ pub fn audit_dockerfile(content: &str, source_label: &str) -> Vec<Finding> {
                     ));
                 }
             }
-            "RUN" => {
-                if has_pipe_to_shell(rest) {
-                    let mut ev = Map::new();
-                    ev.insert("line".to_string(), json!(line_no));
-                    ev.insert("instruction".to_string(), json!("RUN"));
-                    ev.insert("cis_ref".to_string(), json!("CIS Docker 4.9"));
-                    findings.push(docker_finding(
-                        "HOST-206",
-                        Severity::Medium,
-                        "Unverified remote artifact fetch in Dockerfile",
-                        format!(
-                            "Dockerfile pipes curl/wget output directly into a shell on line {}.",
-                            line_no
-                        ),
-                        &target,
-                        ev,
-                        "Download remote scripts first, verify SHA-256 checksums, and avoid piping directly to sh/bash.",
-                        "D3-SPP",
-                        &format!("l{line_no}-run"),
-                        now,
-                    ));
-                }
+            "RUN" if has_pipe_to_shell(rest) => {
+                let mut ev = Map::new();
+                ev.insert("line".to_string(), json!(line_no));
+                ev.insert("instruction".to_string(), json!("RUN"));
+                ev.insert("cis_ref".to_string(), json!("CIS Docker 4.9"));
+                findings.push(docker_finding(
+                    "HOST-206",
+                    Severity::Medium,
+                    "Unverified remote artifact fetch in Dockerfile",
+                    format!(
+                        "Dockerfile pipes curl/wget output directly into a shell on line {}.",
+                        line_no
+                    ),
+                    &target,
+                    ev,
+                    "Download remote scripts first, verify SHA-256 checksums, and avoid piping directly to sh/bash.",
+                    "D3-SPP",
+                    &format!("l{line_no}-run"),
+                    now,
+                ));
             }
             _ => {}
         }

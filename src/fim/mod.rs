@@ -468,6 +468,7 @@ mod tests {
 
         // Restore writable permission on Windows before TempDir cleanup.
         #[cfg(not(unix))]
+        #[allow(clippy::permissions_set_readonly_false)]
         {
             let mut restore = fs::metadata(&perm_file).unwrap().permissions();
             restore.set_readonly(false);
