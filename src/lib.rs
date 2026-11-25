@@ -2,6 +2,7 @@
 
 pub mod audit;
 pub mod fim;
+pub mod mcp;
 pub mod report;
 pub mod schema;
 
