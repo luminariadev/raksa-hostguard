@@ -1,0 +1,16 @@
+# Example raksa-hostguard v0.2.0 policy and suppression manifest
+# Usage: raksa-hostguard audit-workspace --path . --policy examples/hostguard-policy.yml --fail-on high
+
+# Optional floor filter: info | low | medium | high | critical
+min_severity: low
+
+suppressions:
+  - rule_id: HOST-204
+    target_contains: Dockerfile.dev
+    reason: Local development container intentionally tracks rolling toolchain tags
+    expires_on: "2027-06-30"
+
+  - rule_id: HOST-106
+    target_contains: bastion-sshd_config
+    reason: Bastion jump host requires explicit TCP forwarding with short ClientAliveInterval
+    expires_on: "2027-03-31"

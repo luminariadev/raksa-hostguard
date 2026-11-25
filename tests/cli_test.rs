@@ -214,4 +214,197 @@ fn cli_runtime_and_arg_errors_return_exit_1() {
         .output()
         .expect("run bad flag");
     assert_eq!(bad_flag.status.code(), Some(1));
+
+    let empty_host = Command::new(bin_path())
+        .arg("audit-host")
+        .output()
+        .expect("run audit-host without targets");
+    assert_eq!(empty_host.status.code(), Some(1));
+}
+
+#[test]
+fn cli_signed_fim_tamper_and_watch_cycles_work() {
+    let dir = tempdir().expect("tempdir");
+    let watched = dir.path().join("etc");
+    fs::create_dir_all(&watched).unwrap();
+    let cfg = watched.join("daemon.conf");
+    fs::write(&cfg, "secure=1\n").unwrap();
+    let baseline = dir.path().join("signed-baseline.json");
+
+    let init = Command::new(bin_path())
+        .env("RAKSA_TEST_HMAC_KEY", "super-strong-signing-key")
+        .args([
+            "fim",
+            "init",
+            "--path",
+            watched.to_str().unwrap(),
+            "--out",
+            baseline.to_str().unwrap(),
+            "--sign-key-env",
+            "RAKSA_TEST_HMAC_KEY",
+            "--workers",
+            "2",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run signed fim init");
+    assert_eq!(init.status.code(), Some(0));
+    let init_json: Value = serde_json::from_slice(&init.stdout).unwrap();
+    assert_eq!(init_json["signed"], true);
+
+    let clean = Command::new(bin_path())
+        .env("RAKSA_TEST_HMAC_KEY", "super-strong-signing-key")
+        .args([
+            "fim",
+            "check",
+            "--baseline",
+            baseline.to_str().unwrap(),
+            "--sign-key-env",
+            "RAKSA_TEST_HMAC_KEY",
+            "--fail-on",
+            "critical",
+        ])
+        .output()
+        .expect("clean signed fim check");
+    assert_eq!(clean.status.code(), Some(0));
+
+    // Tamper file contents cleanly first to exercise watch cycle breach
+    fs::write(&cfg, "secure=0\n").unwrap();
+    let watch = Command::new(bin_path())
+        .env("RAKSA_TEST_HMAC_KEY", "super-strong-signing-key")
+        .args([
+            "fim",
+            "watch",
+            "--baseline",
+            baseline.to_str().unwrap(),
+            "--interval-secs",
+            "0",
+            "--max-cycles",
+            "2",
+            "--sign-key-env",
+            "RAKSA_TEST_HMAC_KEY",
+            "--format",
+            "json",
+            "--fail-on",
+            "critical",
+        ])
+        .output()
+        .expect("run fim watch");
+    assert_eq!(watch.status.code(), Some(2));
+    let watch_out = String::from_utf8_lossy(&watch.stdout);
+    assert!(watch_out.contains("HOST-001"));
+
+    // Now tamper baseline signature itself and expect HOST-005
+    let raw_snap = fs::read_to_string(&baseline).unwrap();
+    let mut snap_val: Value = serde_json::from_str(&raw_snap).unwrap();
+    snap_val["signature_hmac_sha256"] = Value::String("0".repeat(64));
+    fs::write(&baseline, serde_json::to_string_pretty(&snap_val).unwrap()).unwrap();
+
+    let tampered = Command::new(bin_path())
+        .env("RAKSA_TEST_HMAC_KEY", "super-strong-signing-key")
+        .args([
+            "fim",
+            "check",
+            "--baseline",
+            baseline.to_str().unwrap(),
+            "--sign-key-env",
+            "RAKSA_TEST_HMAC_KEY",
+            "--format",
+            "json",
+            "--fail-on",
+            "critical",
+        ])
+        .output()
+        .expect("check tampered signature");
+    assert_eq!(tampered.status.code(), Some(2));
+    let rep: Value = serde_json::from_slice(&tampered.stdout).unwrap();
+    assert!(rep["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f["rule_id"] == "HOST-005"));
+}
+
+#[test]
+fn cli_audit_host_and_workspace_with_policy_work() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    let ok = Command::new(bin_path())
+        .args([
+            "audit-host",
+            "--sysctl",
+            manifest
+                .join("testdata/sysctl_hardened.conf")
+                .to_str()
+                .unwrap(),
+            "--sudoers",
+            manifest.join("testdata/sudoers_hardened").to_str().unwrap(),
+            "--fail-on",
+            "low",
+        ])
+        .output()
+        .expect("audit-host hardened");
+    assert_eq!(ok.status.code(), Some(0));
+
+    let bad = Command::new(bin_path())
+        .args([
+            "audit-host",
+            "--sysctl",
+            manifest
+                .join("testdata/sysctl_insecure.conf")
+                .to_str()
+                .unwrap(),
+            "--sudoers",
+            manifest.join("testdata/sudoers_insecure").to_str().unwrap(),
+            "--format",
+            "json",
+            "--fail-on",
+            "high",
+        ])
+        .output()
+        .expect("audit-host insecure");
+    assert_eq!(bad.status.code(), Some(2));
+    let host_rep: Value = serde_json::from_slice(&bad.stdout).unwrap();
+    let host_rules: Vec<&str> = host_rep["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["rule_id"].as_str().unwrap())
+        .collect();
+    assert!(host_rules.contains(&"HOST-301"));
+    assert!(host_rules.contains(&"HOST-302"));
+    assert!(host_rules.contains(&"HOST-304"));
+
+    // Workspace audit with policy_suppress.yml suppresses HOST-204 on Dockerfile.insecure
+    let ws = Command::new(bin_path())
+        .args([
+            "audit-workspace",
+            "--path",
+            manifest.join("testdata").to_str().unwrap(),
+            "--policy",
+            manifest
+                .join("testdata/policy_suppress.yml")
+                .to_str()
+                .unwrap(),
+            "--format",
+            "json",
+            "--fail-on",
+            "critical",
+        ])
+        .output()
+        .expect("audit-workspace");
+    assert_eq!(ws.status.code(), Some(2));
+    let ws_rep: Value = serde_json::from_slice(&ws.stdout).unwrap();
+    let df_204_remaining = ws_rep["findings"].as_array().unwrap().iter().any(|f| {
+        f["rule_id"] == "HOST-204"
+            && f["target"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Dockerfile.insecure")
+    });
+    assert!(
+        !df_204_remaining,
+        "HOST-204 for Dockerfile.insecure should be suppressed by policy"
+    );
 }
