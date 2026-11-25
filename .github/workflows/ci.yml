@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  lint-and-test:
+    name: Format, Clippy, and Test Suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: Run strict clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run unit and CLI integration tests
+        run: cargo test --locked
+
+  security-audit:
+    name: Dependency Advisory Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Run cargo audit
+        run: cargo audit
+
+  cli-smoke-and-docker:
+    name: Release CLI Smoke and Distroless Image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Verify CLI subcommands and exit gates
+        run: |
+          ./target/release/raksa-hostguard version
+          ./target/release/raksa-hostguard rules --format json > rules.json
+          ./target/release/raksa-hostguard audit-ssh --path testdata/sshd_hardened.conf --fail-on low
+          ./target/release/raksa-hostguard audit-docker --path testdata/Dockerfile.hardened --fail-on low
+
+          set +e
+          ./target/release/raksa-hostguard audit-ssh --path testdata/sshd_insecure.conf --format sarif --fail-on high > ssh.sarif
+          ssh_rc=$?
+          ./target/release/raksa-hostguard audit-docker --path testdata/docker-compose.insecure.yml --format json --fail-on critical > compose.json
+          docker_rc=$?
+          set -e
+
+          test "$ssh_rc" -eq 2
+          test "$docker_rc" -eq 2
+
+      - name: Build distroless Docker image and run fixture smoke
+        run: |
+          docker build -t raksa-hostguard:ci .
+          docker run --rm raksa-hostguard:ci version
+          set +e
+          docker run --rm -v "${{ github.workspace }}/testdata:/testdata:ro" raksa-hostguard:ci audit-docker --path /testdata/Dockerfile.insecure --fail-on medium
+          rc=$?
+          set -e
+          test "$rc" -eq 2
