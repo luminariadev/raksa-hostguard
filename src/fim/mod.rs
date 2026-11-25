@@ -396,3 +396,102 @@ fn modified_unix(meta: &fs::Metadata) -> i64 {
 fn short_hash(hash: &str) -> &str {
     hash.get(..12).unwrap_or(hash)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use tempfile::TempDir;
+
+    #[test]
+    fn clean_directory_and_roundtrip_produce_zero_findings() {
+        let dir = TempDir::new().unwrap();
+        let file_a = dir.path().join("app.conf");
+        let file_log = dir.path().join("debug.log");
+        fs::write(&file_a, b"port=8443\n").unwrap();
+        fs::write(&file_log, b"ignore me\n").unwrap();
+
+        let (snap, stats) = create_snapshot(
+            &[dir.path().to_path_buf()],
+            &["*.log".to_string()],
+            DEFAULT_MAX_FILE_BYTES,
+        )
+        .unwrap();
+
+        assert_eq!(stats.files_hashed, 1);
+        assert_eq!(snap.entries.len(), 1);
+
+        let snap_dir = TempDir::new().unwrap();
+        let snap_path = snap_dir.path().join("baseline.json");
+        save_snapshot(&snap_path, &snap).unwrap();
+        let loaded = load_snapshot(&snap_path).unwrap();
+
+        let findings = verify_snapshot(&loaded).unwrap();
+        assert!(
+            findings.is_empty(),
+            "expected clean check, got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn detects_content_delete_add_and_permission_drift() {
+        let dir = TempDir::new().unwrap();
+        let mod_file = dir.path().join("binary.bin");
+        let del_file = dir.path().join("removed.txt");
+        let perm_file = dir.path().join("secret.key");
+
+        fs::write(&mod_file, b"original-payload").unwrap();
+        fs::write(&del_file, b"to-be-deleted").unwrap();
+        fs::write(&perm_file, b"stable-content").unwrap();
+
+        let (snap, _) =
+            create_snapshot(&[dir.path().to_path_buf()], &[], DEFAULT_MAX_FILE_BYTES).unwrap();
+
+        // Trigger HOST-001 (content modified), HOST-002 (deleted), HOST-003 (added), HOST-004 (mode)
+        fs::write(&mod_file, b"tampered-payload").unwrap();
+        fs::remove_file(&del_file).unwrap();
+        fs::write(dir.path().join("backdoor.sh"), b"unexpected").unwrap();
+
+        let mut perms = fs::metadata(&perm_file).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o400);
+        }
+        #[cfg(not(unix))]
+        {
+            perms.set_readonly(true);
+        }
+        fs::set_permissions(&perm_file, perms).unwrap();
+
+        let findings = verify_snapshot(&snap).unwrap();
+
+        // Restore writable permission on Windows before TempDir cleanup.
+        #[cfg(not(unix))]
+        {
+            let mut restore = fs::metadata(&perm_file).unwrap().permissions();
+            restore.set_readonly(false);
+            let _ = fs::set_permissions(&perm_file, restore);
+        }
+
+        let rules: HashSet<&str> = findings.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(rules.contains("HOST-001"), "missing HOST-001: {findings:?}");
+        assert!(rules.contains("HOST-002"), "missing HOST-002: {findings:?}");
+        assert!(rules.contains("HOST-003"), "missing HOST-003: {findings:?}");
+        assert!(rules.contains("HOST-004"), "missing HOST-004: {findings:?}");
+    }
+
+    #[test]
+    fn skips_oversized_files_safely() {
+        let dir = TempDir::new().unwrap();
+        let small = dir.path().join("small.txt");
+        let large = dir.path().join("huge.bin");
+        fs::write(&small, b"ok").unwrap();
+        fs::write(&large, vec![b'A'; 4096]).unwrap();
+
+        let (snap, stats) = create_snapshot(&[dir.path().to_path_buf()], &[], 1024).unwrap();
+        assert_eq!(stats.files_hashed, 1);
+        assert_eq!(stats.files_skipped_oversize, 1);
+        assert_eq!(snap.entries.len(), 1);
+    }
+}
