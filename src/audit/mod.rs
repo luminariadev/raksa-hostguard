@@ -1,3 +1,4 @@
+pub mod docker;
 pub mod ssh;
 
 use std::fs::File;
