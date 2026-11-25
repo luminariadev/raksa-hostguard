@@ -1,0 +1,7 @@
+/target/
+*.sarif
+*.tmp
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
