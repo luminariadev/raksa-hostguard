@@ -1,0 +1,11 @@
+# Multi-stage hardened Dockerfile: builder uses root, final stage drops privileges
+FROM rust:1.86-alpine AS builder
+WORKDIR /src
+COPY . .
+RUN echo "building binary in builder stage"
+
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:0000000000000000000000000000000000000000000000000000000000000000
+COPY --from=builder /etc/os-release /etc/os-release
+ENV APP_MODE="production"
+USER nonroot:nonroot
+ENTRYPOINT ["/app"]

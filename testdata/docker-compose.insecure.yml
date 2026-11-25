@@ -1,0 +1,14 @@
+# Intentionally insecure docker-compose definition for test validation
+services:
+  control_plane:
+    image: alpine
+    user: "0:0"
+    privileged: true
+    network_mode: host
+    pid: host
+    cap_add:
+      - SYS_ADMIN
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      ADMIN_PASSWORD: compose_literal_secret_abc

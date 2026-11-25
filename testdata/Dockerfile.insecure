@@ -1,0 +1,7 @@
+# Intentionally insecure Dockerfile for test validation
+FROM ubuntu:latest
+ENV DB_PASSWORD="super-secret-literal-password-999"
+ARG API_TOKEN=hardcoded_token_value_12345
+ADD https://example.com/bootstrap.tar.gz /tmp/bootstrap.tar.gz
+RUN curl -fsSL https://example.com/install.sh | bash
+CMD ["/bin/sh"]
