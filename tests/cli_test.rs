@@ -26,7 +26,7 @@ fn cli_version_and_rules_work() {
         .expect("run rules");
     assert_eq!(rules.status.code(), Some(0));
     let parsed: Value = serde_json::from_slice(&rules.stdout).expect("parse rules json");
-    assert_eq!(parsed.as_array().expect("rules array").len(), 24);
+    assert_eq!(parsed.as_array().expect("rules array").len(), 29);
 }
 
 #[test]
@@ -186,6 +186,16 @@ fn cli_mcp_stdio_handshake_works() {
         )
         .unwrap();
         writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list"}}"#).unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"hostguard_audit_systemd","arguments":{{"content":"[Service]\nUser=root\nExecStart=/usr/bin/app\n"}}}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"hostguard_suggest_fix","arguments":{{"kind":"daemon","content":"{{\"icc\": true}}"}}}}}}"#
+        )
+        .unwrap();
     }
 
     let output = child.wait_with_output().expect("wait mcp output");
@@ -196,9 +206,13 @@ fn cli_mcp_stdio_handshake_works() {
         .filter(|l| !l.trim().is_empty())
         .map(|l| serde_json::from_str(l).expect("valid rpc response"))
         .collect();
-    assert_eq!(lines.len(), 2);
+    assert_eq!(lines.len(), 4);
     assert_eq!(lines[0]["result"]["serverInfo"]["name"], "raksa-hostguard");
-    assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 7);
+    assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 9);
+    let sys_text = lines[2]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(sys_text.contains("HOST-305"));
+    let fix_text = lines[3]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(fix_text.contains("\\\"icc\\\": false"));
 }
 
 #[test]
@@ -407,4 +421,237 @@ fn cli_audit_host_and_workspace_with_policy_work() {
         !df_204_remaining,
         "HOST-204 for Dockerfile.insecure should be suppressed by policy"
     );
+}
+
+#[test]
+fn cli_v3_host_daemon_markdown_ndjson_baselines_fix_preview_and_siem_out() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = tempdir().expect("tempdir");
+
+    // 1. Hardened v0.3.0 host & daemon checks pass with exit 0
+    let ok_host = Command::new(bin_path())
+        .args([
+            "audit-host",
+            "--systemd",
+            manifest
+                .join("testdata/app.hardened.service")
+                .to_str()
+                .unwrap(),
+            "--persistence",
+            manifest.join("testdata/cron_hardened").to_str().unwrap(),
+            "--auth-policy",
+            manifest
+                .join("testdata/pam_hardened.conf")
+                .to_str()
+                .unwrap(),
+            "--kernel-audit",
+            manifest
+                .join("testdata/modprobe_hardened.conf")
+                .to_str()
+                .unwrap(),
+            "--fail-on",
+            "low",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(ok_host.status.code(), Some(0));
+
+    let ok_daemon = Command::new(bin_path())
+        .args([
+            "audit-docker",
+            "--path",
+            manifest
+                .join("testdata/daemon.hardened.json")
+                .to_str()
+                .unwrap(),
+            "--fail-on",
+            "low",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(ok_daemon.status.code(), Some(0));
+
+    // 2. Insecure v0.3.0 host & daemon checks emit HOST-210 and HOST-305..308 with Markdown + NDJSON + baseline gating
+    let bad_daemon = Command::new(bin_path())
+        .args([
+            "audit-docker",
+            "--path",
+            manifest
+                .join("testdata/daemon.insecure.json")
+                .to_str()
+                .unwrap(),
+            "--format",
+            "markdown",
+            "--fail-on",
+            "high",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(bad_daemon.status.code(), Some(2));
+    let md_txt = String::from_utf8_lossy(&bad_daemon.stdout);
+    assert!(md_txt.contains("Posture Score"));
+    assert!(md_txt.contains("HOST-210"));
+
+    let baseline_file = dir.path().join("host-baseline.json");
+    let bad_host = Command::new(bin_path())
+        .args([
+            "audit-host",
+            "--systemd",
+            manifest
+                .join("testdata/app.insecure.service")
+                .to_str()
+                .unwrap(),
+            "--persistence",
+            manifest.join("testdata/cron_insecure").to_str().unwrap(),
+            "--auth-policy",
+            manifest
+                .join("testdata/login_insecure.defs")
+                .to_str()
+                .unwrap(),
+            "--kernel-audit",
+            manifest
+                .join("testdata/audit_insecure.rules")
+                .to_str()
+                .unwrap(),
+            "--format",
+            "ndjson",
+            "--write-baseline",
+            baseline_file.to_str().unwrap(),
+            "--fail-on",
+            "high",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(bad_host.status.code(), Some(2));
+    let ndjson_txt = String::from_utf8_lossy(&bad_host.stdout);
+    let ndjson_lines: Vec<Value> = ndjson_txt
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid ndjson finding line"))
+        .collect();
+    assert!(ndjson_lines.iter().any(|v| v["rule_id"] == "HOST-305"));
+    assert!(ndjson_lines.iter().any(|v| v["rule_id"] == "HOST-306"));
+    assert!(ndjson_lines.iter().any(|v| v["rule_id"] == "HOST-307"));
+    assert!(ndjson_lines.iter().any(|v| v["rule_id"] == "HOST-308"));
+
+    let recheck = Command::new(bin_path())
+        .args([
+            "audit-host",
+            "--systemd",
+            manifest
+                .join("testdata/app.insecure.service")
+                .to_str()
+                .unwrap(),
+            "--persistence",
+            manifest.join("testdata/cron_insecure").to_str().unwrap(),
+            "--auth-policy",
+            manifest
+                .join("testdata/login_insecure.defs")
+                .to_str()
+                .unwrap(),
+            "--kernel-audit",
+            manifest
+                .join("testdata/audit_insecure.rules")
+                .to_str()
+                .unwrap(),
+            "--baseline",
+            baseline_file.to_str().unwrap(),
+            "--format",
+            "json",
+            "--fail-on",
+            "low",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(recheck.status.code(), Some(0));
+    let recheck_json: Value = serde_json::from_slice(&recheck.stdout).unwrap();
+    assert_eq!(recheck_json["posture"]["score"], 100);
+    assert_eq!(recheck_json["summary"]["total"], 0);
+
+    // 3. fix-preview diff and json modes
+    let fix_diff = Command::new(bin_path())
+        .args([
+            "fix-preview",
+            "--path",
+            manifest
+                .join("testdata/app.insecure.service")
+                .to_str()
+                .unwrap(),
+            "--kind",
+            "systemd",
+            "--format",
+            "diff",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(fix_diff.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&fix_diff.stdout).contains("+User=nonroot"));
+
+    let fix_json = Command::new(bin_path())
+        .args([
+            "fix-preview",
+            "--path",
+            manifest
+                .join("testdata/daemon.insecure.json")
+                .to_str()
+                .unwrap(),
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(fix_json.status.code(), Some(0));
+    let fj: Value = serde_json::from_slice(&fix_json.stdout).unwrap();
+    assert_eq!(fj["count"], 1);
+
+    // 4. Event-driven fim watch --siem-out emits Schema v1 NDJSON line
+    let watched = dir.path().join("watched");
+    fs::create_dir_all(&watched).unwrap();
+    let target = watched.join("app.conf");
+    fs::write(&target, "mode=secure\n").unwrap();
+    let snap_path = dir.path().join("snap.json");
+    let siem_out = dir.path().join("siem-events.ndjson");
+
+    let init = Command::new(bin_path())
+        .args([
+            "fim",
+            "init",
+            "--path",
+            watched.to_str().unwrap(),
+            "--out",
+            snap_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(init.status.code(), Some(0));
+
+    // Mutate after init so Cycle 1 detects drift and writes NDJSON to --siem-out
+    fs::write(&target, "mode=tampered\n").unwrap();
+    let watch = Command::new(bin_path())
+        .args([
+            "fim",
+            "watch",
+            "--baseline",
+            snap_path.to_str().unwrap(),
+            "--watch-mode",
+            "events",
+            "--interval-secs",
+            "0",
+            "--debounce-ms",
+            "30",
+            "--max-cycles",
+            "1",
+            "--siem-out",
+            siem_out.to_str().unwrap(),
+            "--format",
+            "ndjson",
+            "--fail-on",
+            "critical",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(watch.status.code(), Some(2));
+    let siem_raw = fs::read_to_string(&siem_out).unwrap();
+    let first_ev: Value = serde_json::from_str(siem_raw.lines().next().unwrap()).unwrap();
+    assert_eq!(first_ev["rule_id"], "HOST-001");
+    assert_eq!(first_ev["layer"], "host-hardening");
 }

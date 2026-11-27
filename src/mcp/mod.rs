@@ -1,8 +1,12 @@
 use crate::audit::audit_workspace;
-use crate::audit::docker::{audit_compose, audit_docker_path, audit_dockerfile};
+use crate::audit::docker::{
+    audit_compose, audit_daemon_json, audit_docker_path, audit_dockerfile, audit_podman_conf,
+};
 use crate::audit::host::{
-    audit_host_permissions_path, audit_sudoers_content, audit_sudoers_path, audit_sysctl_content,
-    audit_sysctl_path,
+    audit_auth_policy_content, audit_auth_policy_path, audit_host_permissions_path,
+    audit_kernel_audit_content, audit_kernel_audit_path, audit_persistence_content,
+    audit_persistence_path, audit_sudoers_content, audit_sudoers_path, audit_sysctl_content,
+    audit_sysctl_path, audit_systemd_content, audit_systemd_path,
 };
 use crate::audit::ssh::{audit_sshd_config, audit_sshd_file};
 use crate::audit::MAX_CONFIG_BYTES;
@@ -11,6 +15,7 @@ use crate::fim::{
     create_snapshot_with_workers, default_worker_count, load_snapshot, save_snapshot,
     sign_snapshot, verify_snapshot_signed,
 };
+use crate::fix::{generate_fix_preview_content, generate_fix_preview_path, FixKind};
 use crate::policy::{apply_policy, load_policy};
 use crate::schema::catalog::rule_catalog;
 use crate::schema::{Finding, Report};
@@ -178,6 +183,8 @@ fn handle_tool_call(req_id: Value, params: &Map<String, Value>) -> Value {
         "hostguard_audit_docker" => call_audit_docker(req_id, &args),
         "hostguard_audit_host" => call_audit_host(req_id, &args),
         "hostguard_audit_workspace" => call_audit_workspace(req_id, &args),
+        "hostguard_audit_systemd" => call_audit_systemd(req_id, &args),
+        "hostguard_suggest_fix" => call_suggest_fix(req_id, &args),
         unknown => rpc_error(req_id, -32602, &format!("Unknown tool: {unknown}")),
     }
 }
@@ -435,11 +442,21 @@ fn call_audit_docker(req_id: Value, args: &Map<String, Value>) -> Value {
                         )
                     }
                 },
+                "daemon" | "daemon.json" => match audit_daemon_json(c, label) {
+                    Ok(f) => f,
+                    Err(err) => {
+                        return rpc_result(
+                            req_id,
+                            tool_err(&format!("invalid daemon.json: {err}")),
+                        )
+                    }
+                },
+                "podman" | "containers.conf" => audit_podman_conf(c, label),
                 other => {
                     return rpc_error(
                         req_id,
                         -32602,
-                        &format!("Invalid params: unsupported kind '{other}' (expected dockerfile or compose)"),
+                        &format!("Invalid params: unsupported kind '{other}' (expected dockerfile, compose, daemon, or podman)"),
                     )
                 }
             }
@@ -453,7 +470,13 @@ fn call_audit_docker(req_id: Value, args: &Map<String, Value>) -> Value {
         }
     };
 
-    let report = Report::new(findings, Utc::now());
+    let filtered = match maybe_apply_policy(findings, args) {
+        Ok(f) => f,
+        Err(McpKeyError::InvalidParam(msg)) => return rpc_error(req_id, -32602, &msg),
+        Err(McpKeyError::Runtime(msg)) => return rpc_result(req_id, tool_err(&msg)),
+    };
+
+    let report = Report::new(filtered, Utc::now());
     rpc_result(
         req_id,
         tool_ok(&serde_json::to_string_pretty(&report).unwrap_or_default()),
@@ -520,7 +543,7 @@ fn call_audit_host(req_id: Value, args: &Map<String, Value>) -> Value {
         return rpc_error(
             req_id,
             -32602,
-            "Invalid params: missing string 'kind' (sysctl, sudoers, or permissions)",
+            "Invalid params: missing string 'kind' (sysctl, sudoers, permissions, systemd, persistence, auth, or kernel)",
         );
     };
     let kind = kind_raw.trim().to_ascii_lowercase();
@@ -586,7 +609,94 @@ fn call_audit_host(req_id: Value, args: &Map<String, Value>) -> Value {
                 "Invalid params: kind 'permissions' requires filesystem 'path', not inline 'content'",
             )
         }
-        (other, Some(_), Some(_)) | (other, None, None) if matches!(other, "sysctl" | "sudoers" | "permissions") => {
+        ("systemd", Some(p), None) => match audit_systemd_path(Path::new(p)) {
+            Ok(f) => f,
+            Err(err) => {
+                return rpc_result(
+                    req_id,
+                    tool_err(&format!("failed to audit systemd '{p}': {err}")),
+                )
+            }
+        },
+        ("systemd", None, Some(c)) => {
+            if c.len() > MAX_CONFIG_BYTES {
+                return rpc_error(
+                    req_id,
+                    -32602,
+                    &format!("Invalid params: 'content' exceeds {MAX_CONFIG_BYTES} byte limit"),
+                );
+            }
+            audit_systemd_content(c, label)
+        }
+        ("persistence", Some(p), None) => match audit_persistence_path(Path::new(p)) {
+            Ok(f) => f,
+            Err(err) => {
+                return rpc_result(
+                    req_id,
+                    tool_err(&format!("failed to audit persistence '{p}': {err}")),
+                )
+            }
+        },
+        ("persistence", None, Some(c)) => {
+            if c.len() > MAX_CONFIG_BYTES {
+                return rpc_error(
+                    req_id,
+                    -32602,
+                    &format!("Invalid params: 'content' exceeds {MAX_CONFIG_BYTES} byte limit"),
+                );
+            }
+            audit_persistence_content(c, label)
+        }
+        ("auth", Some(p), None) => match audit_auth_policy_path(Path::new(p)) {
+            Ok(f) => f,
+            Err(err) => {
+                return rpc_result(
+                    req_id,
+                    tool_err(&format!("failed to audit auth policy '{p}': {err}")),
+                )
+            }
+        },
+        ("auth", None, Some(c)) => {
+            if c.len() > MAX_CONFIG_BYTES {
+                return rpc_error(
+                    req_id,
+                    -32602,
+                    &format!("Invalid params: 'content' exceeds {MAX_CONFIG_BYTES} byte limit"),
+                );
+            }
+            audit_auth_policy_content(c, label)
+        }
+        ("kernel", Some(p), None) => match audit_kernel_audit_path(Path::new(p)) {
+            Ok(f) => f,
+            Err(err) => {
+                return rpc_result(
+                    req_id,
+                    tool_err(&format!("failed to audit kernel/auditd '{p}': {err}")),
+                )
+            }
+        },
+        ("kernel", None, Some(c)) => {
+            if c.len() > MAX_CONFIG_BYTES {
+                return rpc_error(
+                    req_id,
+                    -32602,
+                    &format!("Invalid params: 'content' exceeds {MAX_CONFIG_BYTES} byte limit"),
+                );
+            }
+            audit_kernel_audit_content(c, label)
+        }
+        (other, Some(_), Some(_)) | (other, None, None)
+            if matches!(
+                other,
+                "sysctl"
+                    | "sudoers"
+                    | "permissions"
+                    | "systemd"
+                    | "persistence"
+                    | "auth"
+                    | "kernel"
+            ) =>
+        {
             return rpc_error(
                 req_id,
                 -32602,
@@ -597,7 +707,7 @@ fn call_audit_host(req_id: Value, args: &Map<String, Value>) -> Value {
             return rpc_error(
                 req_id,
                 -32602,
-                &format!("Invalid params: unsupported host kind '{other}' (expected sysctl, sudoers, or permissions)"),
+                &format!("Invalid params: unsupported host kind '{other}' (expected sysctl, sudoers, permissions, systemd, persistence, auth, or kernel)"),
             )
         }
     };
@@ -612,6 +722,111 @@ fn call_audit_host(req_id: Value, args: &Map<String, Value>) -> Value {
     rpc_result(
         req_id,
         tool_ok(&serde_json::to_string_pretty(&report).unwrap_or_default()),
+    )
+}
+
+fn call_audit_systemd(req_id: Value, args: &Map<String, Value>) -> Value {
+    let path_opt = args.get("path").and_then(|v| v.as_str());
+    let content_opt = args.get("content").and_then(|v| v.as_str());
+    let label = args
+        .get("source_label")
+        .and_then(|v| v.as_str())
+        .unwrap_or("inline:systemd.service");
+
+    let findings = match (path_opt, content_opt) {
+        (Some(p), None) => match audit_systemd_path(Path::new(p)) {
+            Ok(f) => f,
+            Err(err) => {
+                return rpc_result(
+                    req_id,
+                    tool_err(&format!("failed to audit systemd path '{p}': {err}")),
+                )
+            }
+        },
+        (None, Some(c)) => {
+            if c.len() > MAX_CONFIG_BYTES {
+                return rpc_error(
+                    req_id,
+                    -32602,
+                    &format!("Invalid params: 'content' exceeds {MAX_CONFIG_BYTES} byte limit"),
+                );
+            }
+            audit_systemd_content(c, label)
+        }
+        _ => {
+            return rpc_error(
+                req_id,
+                -32602,
+                "Invalid params: provide exactly one of 'path' or 'content'",
+            )
+        }
+    };
+
+    let filtered = match maybe_apply_policy(findings, args) {
+        Ok(f) => f,
+        Err(McpKeyError::InvalidParam(msg)) => return rpc_error(req_id, -32602, &msg),
+        Err(McpKeyError::Runtime(msg)) => return rpc_result(req_id, tool_err(&msg)),
+    };
+
+    let report = Report::new(filtered, Utc::now());
+    rpc_result(
+        req_id,
+        tool_ok(&serde_json::to_string_pretty(&report).unwrap_or_default()),
+    )
+}
+
+fn call_suggest_fix(req_id: Value, args: &Map<String, Value>) -> Value {
+    let path_opt = args.get("path").and_then(|v| v.as_str());
+    let content_opt = args.get("content").and_then(|v| v.as_str());
+    let label = args
+        .get("source_label")
+        .and_then(|v| v.as_str())
+        .unwrap_or("inline.conf");
+    let kind_raw = args.get("kind").and_then(|v| v.as_str()).unwrap_or("auto");
+    let kind = match kind_raw.parse::<FixKind>() {
+        Ok(k) => k,
+        Err(msg) => return rpc_error(req_id, -32602, &format!("Invalid params: {msg}")),
+    };
+
+    let patches = match (path_opt, content_opt) {
+        (Some(p), None) => match generate_fix_preview_path(Path::new(p), kind) {
+            Ok(list) => list,
+            Err(err) => {
+                return rpc_result(
+                    req_id,
+                    tool_err(&format!("failed to generate fix preview for '{p}': {err}")),
+                )
+            }
+        },
+        (None, Some(c)) => {
+            if c.len() > MAX_CONFIG_BYTES {
+                return rpc_error(
+                    req_id,
+                    -32602,
+                    &format!("Invalid params: 'content' exceeds {MAX_CONFIG_BYTES} byte limit"),
+                );
+            }
+            match generate_fix_preview_content(c, label, kind) {
+                Ok(opt) => opt.into_iter().collect(),
+                Err(err) => return rpc_result(req_id, tool_err(&err)),
+            }
+        }
+        _ => {
+            return rpc_error(
+                req_id,
+                -32602,
+                "Invalid params: provide exactly one of 'path' or 'content'",
+            )
+        }
+    };
+
+    let payload = json!({
+        "count": patches.len(),
+        "patches": patches
+    });
+    rpc_result(
+        req_id,
+        tool_ok(&serde_json::to_string_pretty(&payload).unwrap_or_default()),
     )
 }
 
@@ -647,7 +862,7 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "hostguard_list_rules",
-            "description": "List all 24 host hardening, FIM, SSH, Docker, and Linux CIS/MITRE D3FEND rules supported by raksa-hostguard.",
+            "description": "List all 29 host hardening, FIM, SSH, Docker/daemon, systemd, persistence, auth, and kernel CIS/MITRE D3FEND rules supported by raksa-hostguard.",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -736,31 +951,32 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "hostguard_audit_docker",
-            "description": "Audit a Dockerfile, docker-compose YAML file, directory tree, or inline container definition against CIS Docker rules (HOST-201 through HOST-209) with secret redaction.",
+            "description": "Audit a Dockerfile, docker-compose YAML file, Docker daemon.json, Podman containers.conf, directory tree, or inline container definition against CIS Docker rules (HOST-201 through HOST-210) with secret redaction.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "File or directory path to audit." },
-                    "content": { "type": "string", "description": "Inline Dockerfile or docker-compose YAML text (max 1 MiB)." },
-                    "kind": { "type": "string", "enum": ["dockerfile", "compose"], "description": "Format when auditing inline content (default: dockerfile)." },
-                    "source_label": { "type": "string", "description": "Optional label for inline findings." }
+                    "content": { "type": "string", "description": "Inline Dockerfile, Compose, daemon.json, or Podman containers.conf text (max 1 MiB)." },
+                    "kind": { "type": "string", "enum": ["dockerfile", "compose", "daemon", "podman"], "description": "Format when auditing inline content (default: dockerfile)." },
+                    "source_label": { "type": "string", "description": "Optional label for inline findings." },
+                    "policy_path": { "type": "string", "description": "Optional YAML/JSON suppression policy path." }
                 },
                 "additionalProperties": false
             }
         },
         {
             "name": "hostguard_audit_host",
-            "description": "Audit Linux sysctl configs, sudoers files, or host file permissions against CIS hardening rules (HOST-301 through HOST-304).",
+            "description": "Audit Linux sysctl configs, sudoers files, host permissions, systemd units, cron/persistence hooks, PAM/login.defs, or modprobe/auditd rules against CIS hardening rules (HOST-301 through HOST-308).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "kind": {
                         "type": "string",
-                        "enum": ["sysctl", "sudoers", "permissions"],
+                        "enum": ["sysctl", "sudoers", "permissions", "systemd", "persistence", "auth", "kernel"],
                         "description": "Host audit domain to execute."
                     },
                     "path": { "type": "string", "description": "File or directory path on disk." },
-                    "content": { "type": "string", "description": "Inline sysctl or sudoers config text (max 1 MiB)." },
+                    "content": { "type": "string", "description": "Inline config text (max 1 MiB; unsupported for permissions)." },
                     "source_label": { "type": "string", "description": "Optional label for inline findings." },
                     "policy_path": { "type": "string", "description": "Optional YAML/JSON suppression policy path." }
                 },
@@ -770,7 +986,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "hostguard_audit_workspace",
-            "description": "Recursively audit an entire repository or configuration directory across SSH, Docker/Compose, sysctl, and sudoers configs with optional policy suppression.",
+            "description": "Recursively audit an entire repository or configuration directory across SSH, Docker/daemon, sysctl, sudoers, systemd, persistence, auth, and kernel configs with optional policy suppression.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -778,6 +994,34 @@ fn tool_definitions() -> Value {
                     "policy_path": { "type": "string", "description": "Optional YAML/JSON suppression policy path." }
                 },
                 "required": ["path"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "hostguard_audit_systemd",
+            "description": "Audit a systemd .service unit file, directory (with .service.d drop-ins), or inline unit definition against HOST-305 CIS hardening controls.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "File or directory path containing systemd unit(s)." },
+                    "content": { "type": "string", "description": "Inline systemd unit text (max 1 MiB)." },
+                    "source_label": { "type": "string", "description": "Optional label for inline findings." },
+                    "policy_path": { "type": "string", "description": "Optional YAML/JSON suppression policy path." }
+                },
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "hostguard_suggest_fix",
+            "description": "Generate read-only deterministic unified hardening patches for SSH, sysctl, Dockerfile, Compose, systemd, or Docker daemon.json configurations.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "File or directory path to generate diff previews for." },
+                    "content": { "type": "string", "description": "Inline config text (max 1 MiB)." },
+                    "kind": { "type": "string", "enum": ["auto", "ssh", "sysctl", "dockerfile", "compose", "systemd", "daemon"], "description": "Target config format (default: auto)." },
+                    "source_label": { "type": "string", "description": "Optional label for inline diff headers." }
+                },
                 "additionalProperties": false
             }
         }
@@ -859,13 +1103,13 @@ mod tests {
         let tools = responses[3]["result"]["tools"]
             .as_array()
             .expect("tools array");
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 9);
 
         let rules_text = responses[4]["result"]["content"][0]["text"]
             .as_str()
             .expect("rules text");
         let rules: Value = serde_json::from_str(rules_text).expect("rules json");
-        assert_eq!(rules.as_array().expect("array").len(), 24);
+        assert_eq!(rules.as_array().expect("array").len(), 29);
 
         assert_eq!(responses[5]["error"]["code"], -32601);
         assert_eq!(responses[6]["error"]["code"], -32602);
@@ -1093,5 +1337,91 @@ mod tests {
         assert!(ws_rules.contains(&"HOST-301"));
 
         assert_eq!(responses[3]["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn mcp_audit_systemd_extended_host_and_suggest_fix_work() {
+        let sysd_req = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "hostguard_audit_systemd",
+                "arguments": {
+                    "content": "[Service]\nUser=root\nExecStart=/usr/bin/agent\n"
+                }
+            }
+        })
+        .to_string();
+
+        let daemon_req = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "hostguard_audit_docker",
+                "arguments": {
+                    "kind": "daemon",
+                    "content": "{\"icc\": true}"
+                }
+            }
+        })
+        .to_string();
+
+        let persist_req = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "hostguard_audit_host",
+                "arguments": {
+                    "kind": "persistence",
+                    "content": "* * * * * ops /tmp/runner\n"
+                }
+            }
+        })
+        .to_string();
+
+        let fix_req = json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "hostguard_suggest_fix",
+                "arguments": {
+                    "kind": "ssh",
+                    "content": "PermitRootLogin yes\n"
+                }
+            }
+        })
+        .to_string();
+
+        let resps = run_rpc_session(&[&sysd_req, &daemon_req, &persist_req, &fix_req]);
+        assert_eq!(resps.len(), 4);
+
+        let sysd_rep: Value =
+            serde_json::from_str(resps[0]["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(sysd_rep["findings"][0]["rule_id"], "HOST-305");
+        assert!(sysd_rep["posture"]["score"].as_u64().unwrap() < 100);
+
+        let daemon_rep: Value =
+            serde_json::from_str(resps[1]["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(daemon_rep["findings"][0]["rule_id"], "HOST-210");
+
+        let persist_rep: Value =
+            serde_json::from_str(resps[2]["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(persist_rep["findings"][0]["rule_id"], "HOST-306");
+
+        let fix_rep: Value =
+            serde_json::from_str(resps[3]["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(fix_rep["count"], 1);
+        assert!(fix_rep["patches"][0]["unified_diff"]
+            .as_str()
+            .unwrap()
+            .contains("+PermitRootLogin no"));
     }
 }
