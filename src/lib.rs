@@ -2,6 +2,7 @@
 
 pub mod audit;
 pub mod fim;
+pub mod fix;
 pub mod mcp;
 pub mod policy;
 pub mod report;
