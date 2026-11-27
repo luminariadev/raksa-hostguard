@@ -1,11 +1,13 @@
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
-use std::fs::File;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
+use std::fs::{self, File};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::audit::MAX_CONFIG_BYTES;
-use crate::schema::{Finding, Severity};
+use crate::schema::{Finding, Severity, SCHEMA_VERSION, TOOL_NAME};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Policy {
@@ -23,6 +25,123 @@ pub struct Suppression {
     pub reason: String,
     #[serde(default)]
     pub expires_on: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindingBaseline {
+    pub schema_version: String,
+    pub tool: String,
+    pub generated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub fingerprints: Vec<String>,
+}
+
+pub fn discover_policy_in_dir(dir: &Path) -> Option<PathBuf> {
+    let base = if dir.is_file() {
+        dir.parent().unwrap_or_else(|| Path::new("."))
+    } else {
+        dir
+    };
+    for name in [".hostguard.yml", ".hostguard.yaml"] {
+        let candidate = base.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+pub fn finding_fingerprint(finding: &Finding) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(finding.rule_id.as_bytes());
+    hasher.update(b"|");
+    hasher.update(finding.module.as_bytes());
+    hasher.update(b"|");
+    hasher.update(finding.target.as_bytes());
+    hasher.update(b"|");
+    hasher.update(finding.title.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
+}
+
+pub fn write_finding_baseline(path: &Path, findings: &[Finding]) -> Result<usize, String> {
+    let mut unique = BTreeSet::new();
+    for f in findings {
+        unique.insert(finding_fingerprint(f));
+    }
+    let fingerprints: Vec<String> = unique.into_iter().collect();
+    let count = fingerprints.len();
+
+    let baseline = FindingBaseline {
+        schema_version: SCHEMA_VERSION.to_string(),
+        tool: TOOL_NAME.to_string(),
+        generated_at: Utc::now(),
+        fingerprints,
+    };
+
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create baseline directory {:?}: {e}", parent))?;
+    }
+    let encoded = serde_json::to_string_pretty(&baseline)
+        .map_err(|e| format!("failed to encode finding baseline: {e}"))?;
+    fs::write(path, format!("{encoded}\n"))
+        .map_err(|e| format!("failed to write finding baseline {:?}: {e}", path))?;
+    Ok(count)
+}
+
+pub fn load_finding_baseline(path: &Path) -> Result<FindingBaseline, String> {
+    let mut file =
+        File::open(path).map_err(|e| format!("failed to open baseline file {:?}: {e}", path))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("failed to stat baseline file {:?}: {e}", path))?;
+    if meta.len() > MAX_CONFIG_BYTES as u64 {
+        return Err(format!(
+            "baseline file {:?} exceeds {} byte limit",
+            path, MAX_CONFIG_BYTES
+        ));
+    }
+
+    let mut buf = Vec::with_capacity(meta.len() as usize);
+    (&mut file)
+        .take((MAX_CONFIG_BYTES + 1) as u64)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("failed to read baseline file {:?}: {e}", path))?;
+    if buf.len() > MAX_CONFIG_BYTES {
+        return Err(format!(
+            "baseline file {:?} exceeds {} byte limit",
+            path, MAX_CONFIG_BYTES
+        ));
+    }
+
+    let text = String::from_utf8(buf)
+        .map_err(|e| format!("baseline file {:?} is not valid UTF-8: {e}", path))?;
+    serde_json::from_str(&text)
+        .map_err(|e| format!("failed to parse finding baseline {:?}: {e}", path))
+}
+
+pub fn apply_finding_baseline(
+    findings: Vec<Finding>,
+    baseline: &FindingBaseline,
+) -> (Vec<Finding>, usize) {
+    let known: BTreeSet<&str> = baseline.fingerprints.iter().map(String::as_str).collect();
+    let mut kept = Vec::with_capacity(findings.len());
+    let mut suppressed = 0usize;
+    for finding in findings {
+        let fp = finding_fingerprint(&finding);
+        if known.contains(fp.as_str()) {
+            suppressed += 1;
+        } else {
+            kept.push(finding);
+        }
+    }
+    (kept, suppressed)
 }
 
 pub fn load_policy(path: &Path) -> Result<Policy, String> {
@@ -217,5 +336,32 @@ mod tests {
         let loaded = load_policy(&good_path).expect("valid policy");
         assert_eq!(loaded.min_severity, Some(Severity::Medium));
         assert_eq!(loaded.suppressions.len(), 1);
+    }
+
+    #[test]
+    fn finding_baseline_roundtrip_and_policy_autodiscovery() {
+        let dir = tempdir().unwrap();
+        assert!(discover_policy_in_dir(dir.path()).is_none());
+
+        let hidden = dir.path().join(".hostguard.yml");
+        std::fs::write(&hidden, "min_severity: low\n").unwrap();
+        assert_eq!(discover_policy_in_dir(dir.path()), Some(hidden));
+
+        let f1 = mk_finding(
+            "HOST-305",
+            Severity::High,
+            "file:///etc/systemd/system/app.service",
+        );
+        let f2 = mk_finding("HOST-306", Severity::High, "file:///etc/crontab");
+        let base_path = dir.path().join("baselines/hostguard-baseline.json");
+
+        let count = write_finding_baseline(&base_path, &[f1.clone(), f1.clone()]).unwrap();
+        assert_eq!(count, 1);
+
+        let loaded = load_finding_baseline(&base_path).unwrap();
+        let (kept, suppressed) = apply_finding_baseline(vec![f1, f2.clone()], &loaded);
+        assert_eq!(suppressed, 1);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].rule_id, "HOST-306");
     }
 }

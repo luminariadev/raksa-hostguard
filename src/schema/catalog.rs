@@ -254,6 +254,56 @@ pub fn rule_catalog() -> Vec<RuleInfo> {
             cis_ref: "CIS Linux 5.3.4",
             description: "sudoers grants NOPASSWD ALL privileges or disables authentication via Defaults !authenticate.",
         },
+        RuleInfo {
+            rule_id: "HOST-210",
+            title: "Insecure container runtime daemon configuration",
+            module: "docker-auditor",
+            default_severity: "high",
+            mitre_d3fend: "D3-CH",
+            mitre_technique: "Configuration Hardening",
+            cis_ref: "CIS Docker 2.1-2.16",
+            description: "Docker daemon.json or Podman containers.conf exposes unauthenticated TCP API, enables inter-container traffic, or omits userns-remap / no-new-privileges.",
+        },
+        RuleInfo {
+            rule_id: "HOST-305",
+            title: "Weak systemd service hardening or unsafe ExecStart target",
+            module: "host-auditor",
+            default_severity: "high",
+            mitre_d3fend: "D3-CH",
+            mitre_technique: "Configuration Hardening",
+            cis_ref: "CIS Linux 5.x",
+            description: "systemd service unit runs as root, omits NoNewPrivileges/ProtectSystem/ProtectHome sandboxing, or executes from world-writable / remote paths.",
+        },
+        RuleInfo {
+            rule_id: "HOST-306",
+            title: "Suspicious cron, anacron, at, or shell profile persistence hook",
+            module: "host-auditor",
+            default_severity: "high",
+            mitre_d3fend: "D3-SPP",
+            mitre_technique: "Software Package Pinning",
+            cis_ref: "CIS Linux 5.1",
+            description: "Scheduled task or shell profile downloads remote scripts, injects LD_PRELOAD, hijacks PATH, decodes shell payloads, or executes from temporary paths.",
+        },
+        RuleInfo {
+            rule_id: "HOST-307",
+            title: "Weak PAM authentication/lockout or login.defs password policy",
+            module: "host-auditor",
+            default_severity: "high",
+            mitre_d3fend: "D3-SUC",
+            mitre_technique: "System User Configuration",
+            cis_ref: "CIS Linux 5.3.2 / 5.4.1",
+            description: "PAM config permits nullok/pam_permit or omits lockout protection, or login.defs allows weak UMASK, long expiry, short passwords, or legacy hashing.",
+        },
+        RuleInfo {
+            rule_id: "HOST-308",
+            title: "Missing kernel module blacklist or weak auditd logging policy",
+            module: "host-auditor",
+            default_severity: "medium",
+            mitre_d3fend: "D3-CH",
+            mitre_technique: "Configuration Hardening",
+            cis_ref: "CIS Linux 1.1.1 / 4.1",
+            description: "modprobe.d omits CIS legacy filesystem/protocol blacklists or auditd/audit.rules weakens log retention, omits identity watches, or omits immutable -e 2.",
+        },
     ]
 }
 
@@ -263,9 +313,9 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn catalog_contains_24_unique_rules() {
+    fn catalog_contains_29_unique_rules() {
         let rules = rule_catalog();
-        assert_eq!(rules.len(), 24);
+        assert_eq!(rules.len(), 29);
         let mut seen = HashSet::new();
         for rule in rules {
             assert!(!rule.rule_id.is_empty());

@@ -14,6 +14,8 @@ pub enum OutputFormat {
     Table,
     Json,
     Sarif,
+    Markdown,
+    Ndjson,
 }
 
 impl FromStr for OutputFormat {
@@ -24,8 +26,10 @@ impl FromStr for OutputFormat {
             "table" => Ok(OutputFormat::Table),
             "json" => Ok(OutputFormat::Json),
             "sarif" => Ok(OutputFormat::Sarif),
+            "markdown" | "md" => Ok(OutputFormat::Markdown),
+            "ndjson" => Ok(OutputFormat::Ndjson),
             other => Err(format!(
-                "invalid output format {:?}: expected table, json, or sarif",
+                "invalid output format {:?}: expected table, json, sarif, markdown, or ndjson",
                 other
             )),
         }
@@ -44,6 +48,10 @@ pub fn write_report<W: Write>(
         }
         OutputFormat::Sarif => {
             format_sarif(report).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+        }
+        OutputFormat::Markdown => format_markdown(report),
+        OutputFormat::Ndjson => {
+            format_ndjson(report).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
         }
     };
     writer.write_all(rendered.as_bytes())
@@ -96,10 +104,12 @@ pub fn sanitize_terminal_text(raw: &str) -> String {
 pub fn format_table(report: &Report) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "{} v{} | layer: {} | total: {} (critical: {}, high: {}, medium: {}, low: {}, info: {})\n",
+        "{} v{} | layer: {} | score: {}/100 ({}) | total: {} (critical: {}, high: {}, medium: {}, low: {}, info: {})\n",
         sanitize_terminal_text(&report.tool),
         crate::VERSION,
         sanitize_terminal_text(&report.layer),
+        report.posture.score,
+        sanitize_terminal_text(&report.posture.grade),
         report.summary.total,
         report.summary.critical,
         report.summary.high,
@@ -142,6 +152,60 @@ pub fn format_json(report: &Report) -> Result<String, serde_json::Error> {
     let mut text = serde_json::to_string_pretty(report)?;
     text.push('\n');
     Ok(text)
+}
+
+pub fn format_ndjson(report: &Report) -> Result<String, serde_json::Error> {
+    let mut out = String::new();
+    for finding in &report.findings {
+        let line = serde_json::to_string(finding)?;
+        out.push_str(&line);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+pub fn format_markdown(report: &Report) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "## `raksa-hostguard` v{} Security Report\n\n",
+        crate::VERSION
+    ));
+    out.push_str(&format!(
+        "- **Layer**: `{}`\n- **Posture Score**: **{}/100 ({})**\n- **Total Findings**: `{}` (critical: `{}`, high: `{}`, medium: `{}`, low: `{}`, info: `{}`)\n\n",
+        sanitize_terminal_text(&report.layer),
+        report.posture.score,
+        sanitize_terminal_text(&report.posture.grade),
+        report.summary.total,
+        report.summary.critical,
+        report.summary.high,
+        report.summary.medium,
+        report.summary.low,
+        report.summary.info,
+    ));
+
+    if report.findings.is_empty() {
+        out.push_str("No security findings detected.\n");
+        return out;
+    }
+
+    out.push_str("| Severity | Rule | Module | Target | MITRE D3FEND | Remediation |\n");
+    out.push_str("| :--- | :--- | :--- | :--- | :--- | :--- |\n");
+    for f in &report.findings {
+        out.push_str(&format!(
+            "| {} | `{}` | `{}` | `{}` | `{}` | {} |\n",
+            f.severity.as_str().to_ascii_uppercase(),
+            escape_md_cell(&f.rule_id),
+            escape_md_cell(&f.module),
+            escape_md_cell(&f.target),
+            escape_md_cell(&f.mitre_d3fend),
+            escape_md_cell(&f.remediation),
+        ));
+    }
+    out
+}
+
+fn escape_md_cell(raw: &str) -> String {
+    sanitize_terminal_text(raw).replace('|', "\\|")
 }
 
 pub fn format_sarif(report: &Report) -> Result<String, serde_json::Error> {
@@ -393,5 +457,35 @@ mod tests {
             "web"
         );
         assert_eq!(results[2]["level"], "error");
+    }
+
+    #[test]
+    fn markdown_and_ndjson_emit_posture_and_compact_lines() {
+        let f1 = sample_finding(
+            "HOST-305",
+            Severity::High,
+            "file:///etc/systemd/app.service",
+            Some(3),
+        );
+        let f2 = sample_finding(
+            "HOST-210",
+            Severity::Medium,
+            "file:///etc/docker/daemon.json",
+            None,
+        );
+        let report = Report::new(vec![f1, f2], Utc::now());
+
+        let md = format_markdown(&report);
+        assert!(md.contains("Posture Score"));
+        assert!(md.contains("77/100 (C)"));
+        assert!(md.contains("HOST-305"));
+        assert!(md.contains("HOST-210"));
+
+        let ndjson = format_ndjson(&report).expect("serialize ndjson");
+        let lines: Vec<&str> = ndjson.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let p0: Value = serde_json::from_str(lines[0]).expect("line 0 json");
+        assert_eq!(p0["layer"], "host-hardening");
+        assert_eq!(p0["rule_id"], "HOST-305");
     }
 }

@@ -100,12 +100,42 @@ pub struct Summary {
     pub info: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostureScore {
+    pub score: u8,
+    pub grade: String,
+}
+
+pub fn compute_posture(summary: &Summary) -> PostureScore {
+    let deduction = summary
+        .critical
+        .saturating_mul(25)
+        .saturating_add(summary.high.saturating_mul(15))
+        .saturating_add(summary.medium.saturating_mul(8))
+        .saturating_add(summary.low.saturating_mul(3))
+        .saturating_add(summary.info);
+    let score = 100usize.saturating_sub(deduction) as u8;
+    let grade = match score {
+        95..=100 => "A+",
+        90..=94 => "A",
+        80..=89 => "B",
+        70..=79 => "C",
+        60..=69 => "D",
+        _ => "F",
+    };
+    PostureScore {
+        score,
+        grade: grade.to_string(),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
     pub schema_version: String,
     pub tool: String,
     pub layer: String,
     pub generated_at: DateTime<Utc>,
+    pub posture: PostureScore,
     pub summary: Summary,
     pub findings: Vec<Finding>,
 }
@@ -125,12 +155,14 @@ impl Report {
                 Severity::Info => summary.info += 1,
             }
         }
+        let posture = compute_posture(&summary);
 
         Self {
             schema_version: SCHEMA_VERSION.to_string(),
             tool: TOOL_NAME.to_string(),
             layer: LAYER_HOST.to_string(),
             generated_at,
+            posture,
             summary,
             findings,
         }
@@ -214,6 +246,11 @@ mod tests {
         assert_eq!(rep.summary.medium, 1);
         assert_eq!(rep.summary.low, 1);
         assert_eq!(rep.summary.info, 1);
+        assert_eq!(rep.posture.score, 48);
+        assert_eq!(rep.posture.grade, "F");
         assert!(rep.has_threshold_breach(Some(Severity::High)));
+
+        assert_eq!(empty.posture.score, 100);
+        assert_eq!(empty.posture.grade, "A+");
     }
 }
