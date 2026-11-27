@@ -4,15 +4,18 @@ pub mod sign;
 use crate::schema::{sanitize_id_part, Finding, Severity, LAYER_HOST, SCHEMA_VERSION, TOOL_NAME};
 use chrono::{DateTime, Utc};
 use hash::{hash_file_streaming, FimError, DEFAULT_MAX_FILE_BYTES};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map};
 use sign::{constant_time_eq, hmac_sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 const MODULE_FIM: &str = "fim";
@@ -46,9 +49,35 @@ pub struct SnapshotStats {
     pub files_skipped_error: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WatchMode {
+    #[default]
+    Auto,
+    Events,
+    Poll,
+}
+
+impl FromStr for WatchMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(WatchMode::Auto),
+            "events" => Ok(WatchMode::Events),
+            "poll" => Ok(WatchMode::Poll),
+            other => Err(format!(
+                "invalid watch mode {:?}: expected auto, events, or poll",
+                other
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WatchConfig {
+    pub mode: WatchMode,
     pub interval: Duration,
+    pub debounce: Duration,
     pub max_cycles: Option<usize>,
     pub workers: usize,
 }
@@ -56,7 +85,9 @@ pub struct WatchConfig {
 impl Default for WatchConfig {
     fn default() -> Self {
         Self {
+            mode: WatchMode::Auto,
             interval: Duration::from_secs(5),
+            debounce: Duration::from_millis(250),
             max_cycles: None,
             workers: default_worker_count(),
         }
@@ -442,25 +473,40 @@ pub fn watch_snapshot<F>(
 where
     F: FnMut(usize, &[Finding]) -> bool,
 {
+    match config.mode {
+        WatchMode::Poll => watch_snapshot_poll(snapshot, sign_key, config, &mut on_cycle),
+        WatchMode::Events => watch_snapshot_events(snapshot, sign_key, config, &mut on_cycle),
+        WatchMode::Auto => {
+            if config.interval.is_zero() {
+                watch_snapshot_poll(snapshot, sign_key, config, &mut on_cycle)
+            } else {
+                match setup_notify_watcher(&snapshot.root_paths) {
+                    Ok((watcher, rx)) => {
+                        run_events_loop(snapshot, sign_key, config, watcher, rx, &mut on_cycle)
+                    }
+                    Err(_) => watch_snapshot_poll(snapshot, sign_key, config, &mut on_cycle),
+                }
+            }
+        }
+    }
+}
+
+fn watch_snapshot_poll<F>(
+    snapshot: &BaselineSnapshot,
+    sign_key: Option<&[u8]>,
+    config: &WatchConfig,
+    on_cycle: &mut F,
+) -> Result<(), FimError>
+where
+    F: FnMut(usize, &[Finding]) -> bool,
+{
     let mut seen: HashSet<(String, String, String)> = HashSet::new();
     let mut cycle = 0usize;
 
     loop {
         cycle += 1;
-        let all_findings = verify_snapshot_signed(snapshot, sign_key, config.workers)?;
-        let mut fresh = Vec::new();
-        for finding in all_findings {
-            let key = (
-                finding.rule_id.clone(),
-                finding.target.clone(),
-                finding.description.clone(),
-            );
-            if seen.insert(key) {
-                fresh.push(finding);
-            }
-        }
-
-        let keep_going = on_cycle(cycle, &fresh);
+        let keep_going =
+            run_single_watch_cycle(snapshot, sign_key, config, cycle, &mut seen, on_cycle)?;
         if !keep_going {
             break;
         }
@@ -475,6 +521,148 @@ where
     }
 
     Ok(())
+}
+
+fn watch_snapshot_events<F>(
+    snapshot: &BaselineSnapshot,
+    sign_key: Option<&[u8]>,
+    config: &WatchConfig,
+    on_cycle: &mut F,
+) -> Result<(), FimError>
+where
+    F: FnMut(usize, &[Finding]) -> bool,
+{
+    let (watcher, rx) = setup_notify_watcher(&snapshot.root_paths)?;
+    run_events_loop(snapshot, sign_key, config, watcher, rx, on_cycle)
+}
+
+fn setup_notify_watcher(
+    root_paths: &[String],
+) -> Result<
+    (
+        RecommendedWatcher,
+        mpsc::Receiver<notify::Result<notify::Event>>,
+    ),
+    FimError,
+> {
+    let (tx, rx) = mpsc::channel();
+    let mut watcher = notify::recommended_watcher(move |res| {
+        let _ = tx.send(res);
+    })
+    .map_err(|e| {
+        FimError::InvalidInput(format!("failed to initialize OS filesystem watcher: {e}"))
+    })?;
+
+    let mut attached = 0usize;
+    for root_str in root_paths {
+        let p = Path::new(root_str);
+        let watch_target = if p.exists() {
+            p
+        } else if let Some(parent) = p.parent().filter(|par| par.exists()) {
+            parent
+        } else {
+            continue;
+        };
+        if watcher
+            .watch(watch_target, RecursiveMode::Recursive)
+            .is_ok()
+        {
+            attached += 1;
+        }
+    }
+    if attached == 0 {
+        return Err(FimError::InvalidInput(
+            "no existing baseline root paths could be attached to OS filesystem watcher"
+                .to_string(),
+        ));
+    }
+
+    Ok((watcher, rx))
+}
+
+fn run_events_loop<F>(
+    snapshot: &BaselineSnapshot,
+    sign_key: Option<&[u8]>,
+    config: &WatchConfig,
+    _watcher: RecommendedWatcher,
+    rx: mpsc::Receiver<notify::Result<notify::Event>>,
+    on_cycle: &mut F,
+) -> Result<(), FimError>
+where
+    F: FnMut(usize, &[Finding]) -> bool,
+{
+    let mut seen: HashSet<(String, String, String)> = HashSet::new();
+    let mut cycle = 0usize;
+
+    let reconcile_wait = if config.interval.is_zero() {
+        Duration::from_millis(200)
+    } else {
+        config.interval
+    };
+
+    loop {
+        cycle += 1;
+        let keep_going =
+            run_single_watch_cycle(snapshot, sign_key, config, cycle, &mut seen, on_cycle)?;
+        if !keep_going {
+            break;
+        }
+        if let Some(max) = config.max_cycles {
+            if cycle >= max {
+                break;
+            }
+        }
+
+        match rx.recv_timeout(reconcile_wait) {
+            Ok(_) => {
+                if !config.debounce.is_zero() {
+                    let deadline = Instant::now() + config.debounce;
+                    while let Some(rem) = deadline.checked_duration_since(Instant::now()) {
+                        if rem.is_zero() {
+                            break;
+                        }
+                        match rx.recv_timeout(rem) {
+                            Ok(_) => {}
+                            Err(RecvTimeoutError::Timeout)
+                            | Err(RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // Periodic full-hash reconciliation sweep.
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    Ok(())
+}
+
+fn run_single_watch_cycle<F>(
+    snapshot: &BaselineSnapshot,
+    sign_key: Option<&[u8]>,
+    config: &WatchConfig,
+    cycle: usize,
+    seen: &mut HashSet<(String, String, String)>,
+    on_cycle: &mut F,
+) -> Result<bool, FimError>
+where
+    F: FnMut(usize, &[Finding]) -> bool,
+{
+    let all_findings = verify_snapshot_signed(snapshot, sign_key, config.workers)?;
+    let mut fresh = Vec::new();
+    for finding in all_findings {
+        let key = (
+            finding.rule_id.clone(),
+            finding.target.clone(),
+            finding.description.clone(),
+        );
+        if seen.insert(key) {
+            fresh.push(finding);
+        }
+    }
+    Ok(on_cycle(cycle, &fresh))
 }
 
 fn verify_baseline_entry(
@@ -850,7 +1038,9 @@ mod tests {
         )
         .unwrap();
         let cfg = WatchConfig {
+            mode: WatchMode::Poll,
             interval: Duration::from_millis(5),
+            debounce: Duration::ZERO,
             max_cycles: Some(3),
             workers: 2,
         };
@@ -879,5 +1069,56 @@ mod tests {
             cycle_events[2].1.is_empty(),
             "cycle 3 should deduplicate identical already-reported drift"
         );
+    }
+
+    #[test]
+    fn watch_events_detects_live_file_modification_with_debounce() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("sshd_config");
+        fs::write(&target, b"PermitRootLogin no\n").unwrap();
+
+        let (snap, _) = create_snapshot_with_workers(
+            &[dir.path().to_path_buf()],
+            &[],
+            DEFAULT_MAX_FILE_BYTES,
+            2,
+        )
+        .unwrap();
+
+        let cfg = WatchConfig {
+            mode: WatchMode::Events,
+            interval: Duration::from_secs(10),
+            debounce: Duration::from_millis(60),
+            max_cycles: Some(2),
+            workers: 2,
+        };
+
+        let target_clone = target.clone();
+        let writer_handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(120));
+            fs::write(&target_clone, b"PermitRootLogin yes\n").unwrap();
+        });
+
+        let started = Instant::now();
+        let mut captured = Vec::new();
+        watch_snapshot(&snap, None, &cfg, |cycle, fresh| {
+            captured.push((
+                cycle,
+                fresh.iter().map(|f| f.rule_id.clone()).collect::<Vec<_>>(),
+            ));
+            true
+        })
+        .unwrap();
+        writer_handle.join().unwrap();
+
+        // Kernel notify should trigger cycle 2 quickly (well before the 10s reconciliation timeout).
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "event watcher took too long ({:?}), likely missed OS event",
+            started.elapsed()
+        );
+        assert_eq!(captured.len(), 2);
+        assert!(captured[0].1.is_empty());
+        assert_eq!(captured[1].1, vec!["HOST-001".to_string()]);
     }
 }

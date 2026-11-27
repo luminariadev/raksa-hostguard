@@ -437,6 +437,7 @@ fn cmd_fim_watch(args: FimWatchArgs) -> Result<ExitCode, String> {
         interval: Duration::from_secs(args.interval_secs),
         max_cycles: args.max_cycles,
         workers,
+        ..WatchConfig::default()
     };
 
     let mut breach = false;
