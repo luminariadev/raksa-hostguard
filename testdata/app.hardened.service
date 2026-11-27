@@ -1,0 +1,12 @@
+[Unit]
+Description=Raksa Hardened Telemetry Agent
+
+[Service]
+User=raksa-agent
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ExecStart=/usr/local/bin/raksa-agent --config /etc/raksa/agent.yml
+
+[Install]
+WantedBy=multi-user.target

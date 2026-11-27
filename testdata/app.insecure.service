@@ -1,0 +1,11 @@
+[Unit]
+Description=Insecure Unhardened Service
+
+[Service]
+User=root
+NoNewPrivileges=no
+ProtectSystem=no
+ExecStart=/var/tmp/stage-runner --daemon
+
+[Install]
+WantedBy=multi-user.target

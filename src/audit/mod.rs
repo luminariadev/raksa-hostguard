@@ -73,6 +73,14 @@ pub fn audit_workspace(root: &Path) -> io::Result<Vec<Finding>> {
             findings.extend(host::audit_sysctl_path(&path)?);
         } else if fname.starts_with("sudoers") {
             findings.extend(host::audit_sudoers_path(&path)?);
+        } else if fname.ends_with(".service") {
+            findings.extend(host::audit_systemd_path(&path)?);
+        } else if is_persistence_filename(&fname) {
+            findings.extend(host::audit_persistence_path(&path)?);
+        } else if is_auth_policy_filename(&fname) {
+            findings.extend(host::audit_auth_policy_path(&path)?);
+        } else if is_kernel_audit_filename(&fname) {
+            findings.extend(host::audit_kernel_audit_path(&path)?);
         }
     }
 
@@ -90,8 +98,36 @@ fn is_docker_manifest(lower_name: &str) -> bool {
     lower_name == "dockerfile"
         || lower_name.starts_with("dockerfile.")
         || lower_name.ends_with(".dockerfile")
+        || lower_name == "daemon.json"
+        || lower_name.ends_with(".daemon.json")
+        || (lower_name.starts_with("daemon.") && lower_name.ends_with(".json"))
+        || lower_name == "containers.conf"
+        || lower_name.ends_with(".containers.conf")
         || (lower_name.contains("compose")
             && (lower_name.ends_with(".yml") || lower_name.ends_with(".yaml")))
+}
+
+fn is_persistence_filename(lower_name: &str) -> bool {
+    lower_name == "crontab"
+        || lower_name == "anacrontab"
+        || lower_name.starts_with("cron_")
+        || lower_name.starts_with("cron.")
+}
+
+fn is_auth_policy_filename(lower_name: &str) -> bool {
+    lower_name == "login.defs"
+        || (lower_name.starts_with("login_") && lower_name.ends_with(".defs"))
+        || lower_name == "common-auth"
+        || lower_name == "system-auth"
+        || lower_name.starts_with("pam_")
+        || lower_name.starts_with("pam.")
+}
+
+fn is_kernel_audit_filename(lower_name: &str) -> bool {
+    lower_name.contains("modprobe")
+        || lower_name == "auditd.conf"
+        || lower_name == "audit.rules"
+        || (lower_name.starts_with("audit_") && lower_name.ends_with(".rules"))
 }
 
 #[cfg(test)]
@@ -338,5 +374,104 @@ mod tests {
             !rules.contains("HOST-103"),
             "vendor/ directory must be ignored: {findings:?}"
         );
+    }
+
+    #[test]
+    fn v3_daemon_systemd_persistence_auth_and_kernel_rules_work() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        // Hardened fixtures must emit 0 findings
+        assert!(
+            audit_docker_path(&root.join("testdata/daemon.hardened.json"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            host::audit_systemd_path(&root.join("testdata/app.hardened.service"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            host::audit_persistence_path(&root.join("testdata/cron_hardened"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            host::audit_auth_policy_path(&root.join("testdata/login_hardened.defs"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            host::audit_auth_policy_path(&root.join("testdata/pam_hardened.conf"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            host::audit_kernel_audit_path(&root.join("testdata/modprobe_hardened.conf"))
+                .unwrap()
+                .is_empty()
+        );
+
+        // Insecure fixtures must emit HOST-210 and HOST-305..308
+        let daemon_bad = audit_docker_path(&root.join("testdata/daemon.insecure.json")).unwrap();
+        assert!(daemon_bad.iter().any(|f| f.rule_id == "HOST-210"));
+
+        let podman_bad = super::docker::audit_podman_conf(
+            "[engine]\nprivileged = true\nnetns = \"host\"\nno_new_privileges = false\n",
+            "containers.conf",
+        );
+        assert_eq!(podman_bad.len(), 3);
+        assert!(podman_bad.iter().all(|f| f.rule_id == "HOST-210"));
+
+        let sys_bad =
+            host::audit_systemd_path(&root.join("testdata/app.insecure.service")).unwrap();
+        assert!(sys_bad.iter().any(|f| f.rule_id == "HOST-305"));
+
+        // Verify systemd drop-in override merging clears issues when hardened
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("svc.service"),
+            "[Service]\nExecStart=/usr/bin/svc\n",
+        )
+        .unwrap();
+        let dropin_dir = dir.path().join("svc.service.d");
+        fs::create_dir_all(&dropin_dir).unwrap();
+        fs::write(
+            dropin_dir.join("10-hardening.conf"),
+            "[Service]\nUser=svcuser\nNoNewPrivileges=yes\nProtectSystem=strict\nProtectHome=yes\n",
+        )
+        .unwrap();
+        assert!(host::audit_systemd_path(dir.path()).unwrap().is_empty());
+
+        let cron_bad = host::audit_persistence_path(&root.join("testdata/cron_insecure")).unwrap();
+        assert!(cron_bad.iter().all(|f| f.rule_id == "HOST-306"));
+        assert!(cron_bad.len() >= 4);
+
+        let b64_cmd = format!("* * * * * ops echo dGVzdA== | {}64 -d | sh\n", "base");
+        let b64_bad = host::audit_persistence_content(&b64_cmd, "crontab");
+        assert_eq!(b64_bad.len(), 1);
+        assert_eq!(b64_bad[0].rule_id, "HOST-306");
+
+        let login_bad =
+            host::audit_auth_policy_path(&root.join("testdata/login_insecure.defs")).unwrap();
+        assert!(login_bad.len() >= 4);
+        assert!(login_bad.iter().all(|f| f.rule_id == "HOST-307"));
+
+        let pam_bad =
+            host::audit_auth_policy_path(&root.join("testdata/pam_insecure.conf")).unwrap();
+        assert!(pam_bad.len() >= 3);
+        assert!(pam_bad.iter().all(|f| f.rule_id == "HOST-307"));
+
+        let rules_bad =
+            host::audit_kernel_audit_path(&root.join("testdata/audit_insecure.rules")).unwrap();
+        assert_eq!(rules_bad.len(), 2);
+        assert!(rules_bad.iter().all(|f| f.rule_id == "HOST-308"));
+
+        let auditd_bad = host::audit_kernel_audit_content(
+            "max_log_file_action = ignore\nspace_left_action = suspend\n",
+            "auditd.conf",
+        );
+        assert_eq!(auditd_bad.len(), 2);
+        assert!(auditd_bad.iter().all(|f| f.rule_id == "HOST-308"));
     }
 }

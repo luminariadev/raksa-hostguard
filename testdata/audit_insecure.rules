@@ -1,0 +1,4 @@
+# Incomplete auditd rules missing identity watches and -e 2 immutable flag
+-D
+-b 8192
+-a always,exit -F arch=b64 -S execve -k exec_trace

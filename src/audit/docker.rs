@@ -56,11 +56,26 @@ fn audit_single_docker_file(path: &Path) -> io::Result<Vec<Finding>> {
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    if fname.ends_with(".yml") || fname.ends_with(".yaml") {
+    if is_daemon_json_name(&fname) {
+        audit_daemon_json(&content, &label)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    } else if is_podman_conf_name(&fname) {
+        Ok(audit_podman_conf(&content, &label))
+    } else if fname.ends_with(".yml") || fname.ends_with(".yaml") {
         audit_compose(&content, &label).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     } else {
         Ok(audit_dockerfile(&content, &label))
     }
+}
+
+fn is_daemon_json_name(lower_name: &str) -> bool {
+    lower_name == "daemon.json"
+        || lower_name.ends_with(".daemon.json")
+        || (lower_name.starts_with("daemon.") && lower_name.ends_with(".json"))
+}
+
+fn is_podman_conf_name(lower_name: &str) -> bool {
+    lower_name == "containers.conf" || lower_name.ends_with(".containers.conf")
 }
 
 fn is_docker_manifest(path: &Path) -> bool {
@@ -72,6 +87,8 @@ fn is_docker_manifest(path: &Path) -> bool {
     fname == "dockerfile"
         || fname.starts_with("dockerfile.")
         || fname.ends_with(".dockerfile")
+        || is_daemon_json_name(&fname)
+        || is_podman_conf_name(&fname)
         || (fname.contains("compose") && (fname.ends_with(".yml") || fname.ends_with(".yaml")))
 }
 
@@ -878,6 +895,217 @@ fn detect_exposed_sensitive_port(val: &Value) -> Option<(String, u16)> {
         }
         _ => None,
     }
+}
+
+pub fn audit_daemon_json(content: &str, source_label: &str) -> Result<Vec<Finding>, String> {
+    let val: JsonValue = serde_json::from_str(content)
+        .map_err(|e| format!("parse daemon JSON {:?}: {e}", source_label))?;
+    let Some(obj) = val.as_object() else {
+        return Err(format!(
+            "daemon JSON {:?} must be a JSON object",
+            source_label
+        ));
+    };
+
+    let now = Utc::now();
+    let target = format!("file://{source_label}");
+    let mut findings = Vec::new();
+
+    let tlsverify = obj
+        .get("tlsverify")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if let Some(hosts) = obj.get("hosts").and_then(|v| v.as_array()) {
+        for h in hosts {
+            if let Some(host_str) = h.as_str() {
+                if host_str.trim().to_ascii_lowercase().starts_with("tcp://") && !tlsverify {
+                    let mut ev = Map::new();
+                    ev.insert("host".to_string(), json!(host_str));
+                    ev.insert("tlsverify".to_string(), json!(tlsverify));
+                    ev.insert("cis_ref".to_string(), json!("CIS Docker 2.16"));
+                    findings.push(docker_finding(
+                        "HOST-210",
+                        Severity::Critical,
+                        "Insecure container runtime daemon configuration",
+                        format!(
+                            "Docker daemon in {source_label} binds TCP socket '{host_str}' without tlsverify: true."
+                        ),
+                        &target,
+                        ev,
+                        "Use unix:// sockets only or enable mutual TLS with tlsverify: true, tlscacert, tlscert, and tlskey.",
+                        "D3-CH",
+                        "daemon-tcp-notls",
+                        now,
+                    ));
+                }
+            }
+        }
+    }
+
+    if obj.get("icc").and_then(|v| v.as_bool()) != Some(false) {
+        let mut ev = Map::new();
+        ev.insert("setting".to_string(), json!("icc"));
+        ev.insert(
+            "observed".to_string(),
+            obj.get("icc").cloned().unwrap_or(JsonValue::Null),
+        );
+        ev.insert("cis_ref".to_string(), json!("CIS Docker 2.1"));
+        findings.push(docker_finding(
+            "HOST-210",
+            Severity::High,
+            "Insecure container runtime daemon configuration",
+            format!(
+                "Docker daemon in {source_label} allows unrestricted inter-container communication (expected \"icc\": false)."
+            ),
+            &target,
+            ev,
+            "Set \"icc\": false in daemon.json and use explicit user-defined bridge networks.",
+            "D3-CH",
+            "daemon-icc",
+            now,
+        ));
+    }
+
+    if obj.get("no-new-privileges").and_then(|v| v.as_bool()) != Some(true) {
+        let mut ev = Map::new();
+        ev.insert("setting".to_string(), json!("no-new-privileges"));
+        ev.insert("cis_ref".to_string(), json!("CIS Docker 2.15"));
+        findings.push(docker_finding(
+            "HOST-210",
+            Severity::High,
+            "Insecure container runtime daemon configuration",
+            format!(
+                "Docker daemon in {source_label} does not enforce \"no-new-privileges\": true."
+            ),
+            &target,
+            ev,
+            "Set \"no-new-privileges\": true in daemon.json to block setuid escalation across containers.",
+            "D3-CH",
+            "daemon-nonewpriv",
+            now,
+        ));
+    }
+
+    let has_userns = obj
+        .get("userns-remap")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.trim().is_empty());
+    if !has_userns {
+        let mut ev = Map::new();
+        ev.insert("setting".to_string(), json!("userns-remap"));
+        ev.insert("cis_ref".to_string(), json!("CIS Docker 2.8"));
+        findings.push(docker_finding(
+            "HOST-210",
+            Severity::Medium,
+            "Insecure container runtime daemon configuration",
+            format!(
+                "Docker daemon in {source_label} omits \"userns-remap\" user namespace isolation."
+            ),
+            &target,
+            ev,
+            "Configure \"userns-remap\": \"default\" in daemon.json.",
+            "D3-CH",
+            "daemon-userns",
+            now,
+        ));
+    }
+
+    if obj.get("live-restore").and_then(|v| v.as_bool()) != Some(true) {
+        let mut ev = Map::new();
+        ev.insert("setting".to_string(), json!("live-restore"));
+        ev.insert("cis_ref".to_string(), json!("CIS Docker 2.14"));
+        findings.push(docker_finding(
+            "HOST-210",
+            Severity::Low,
+            "Insecure container runtime daemon configuration",
+            format!("Docker daemon in {source_label} does not enable \"live-restore\": true."),
+            &target,
+            ev,
+            "Set \"live-restore\": true in daemon.json to preserve running containers during daemon upgrades.",
+            "D3-CH",
+            "daemon-liverestore",
+            now,
+        ));
+    }
+
+    Ok(findings)
+}
+
+pub fn audit_podman_conf(content: &str, source_label: &str) -> Vec<Finding> {
+    let now = Utc::now();
+    let target = format!("file://{source_label}");
+    let mut findings = Vec::new();
+
+    for (idx, raw_line) in content.lines().enumerate() {
+        let line_no = idx + 1;
+        let cleaned = raw_line.split('#').next().unwrap_or("").trim();
+        let Some((raw_k, raw_v)) = cleaned.split_once('=') else {
+            continue;
+        };
+        let key = raw_k.trim().to_ascii_lowercase();
+        let val = unquote(raw_v.trim()).to_ascii_lowercase();
+
+        match key.as_str() {
+            "privileged" if val == "true" => {
+                let mut ev = Map::new();
+                ev.insert("line".to_string(), json!(line_no));
+                ev.insert("setting".to_string(), json!("privileged = true"));
+                findings.push(docker_finding(
+                    "HOST-210",
+                    Severity::Critical,
+                    "Insecure container runtime daemon configuration",
+                    format!(
+                        "Podman containers.conf line {line_no} enables default privileged = true."
+                    ),
+                    &target,
+                    ev,
+                    "Set privileged = false in containers.conf.",
+                    "D3-CH",
+                    &format!("podman-l{line_no}-priv"),
+                    now,
+                ));
+            }
+            "netns" if val == "host" => {
+                let mut ev = Map::new();
+                ev.insert("line".to_string(), json!(line_no));
+                ev.insert("setting".to_string(), json!("netns = \"host\""));
+                findings.push(docker_finding(
+                    "HOST-210",
+                    Severity::High,
+                    "Insecure container runtime daemon configuration",
+                    format!("Podman containers.conf line {line_no} sets default netns = \"host\"."),
+                    &target,
+                    ev,
+                    "Remove netns = \"host\" or default to bridge/pasta network isolation.",
+                    "D3-CH",
+                    &format!("podman-l{line_no}-netns"),
+                    now,
+                ));
+            }
+            "no_new_privileges" if val == "false" => {
+                let mut ev = Map::new();
+                ev.insert("line".to_string(), json!(line_no));
+                ev.insert("setting".to_string(), json!("no_new_privileges = false"));
+                findings.push(docker_finding(
+                    "HOST-210",
+                    Severity::High,
+                    "Insecure container runtime daemon configuration",
+                    format!(
+                        "Podman containers.conf line {line_no} sets no_new_privileges = false."
+                    ),
+                    &target,
+                    ev,
+                    "Set no_new_privileges = true in containers.conf.",
+                    "D3-CH",
+                    &format!("podman-l{line_no}-nnp"),
+                    now,
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    findings
 }
 
 #[allow(clippy::too_many_arguments)]

