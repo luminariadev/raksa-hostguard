@@ -1,4 +1,4 @@
-FROM rust:alpine AS builder
+FROM rust:1.90-alpine AS builder
 
 RUN apk add --no-cache musl-dev
 
@@ -15,5 +15,6 @@ FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=builder /src/target/release/raksa-hostguard /raksa-hostguard
 
 USER nonroot:nonroot
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 CMD ["/raksa-hostguard", "version"]
 ENTRYPOINT ["/raksa-hostguard"]
 CMD ["version"]

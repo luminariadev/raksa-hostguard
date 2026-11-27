@@ -1,9 +1,10 @@
 use raksa_hostguard::audit::docker::{audit_compose, audit_dockerfile};
-use raksa_hostguard::audit::host::audit_sysctl_content;
+use raksa_hostguard::audit::host::{audit_sysctl_content, audit_systemd_content};
 use raksa_hostguard::fim::hash::DEFAULT_MAX_FILE_BYTES;
 use raksa_hostguard::fim::{
     create_snapshot_with_workers, default_worker_count, verify_snapshot_with_workers,
 };
+use raksa_hostguard::fix::{generate_fix_preview_content, FixKind};
 use std::fs;
 use std::hint::black_box;
 use std::path::PathBuf;
@@ -129,6 +130,33 @@ fs.suid_dumpable = 0
     }
     let sysctl_elapsed = t_sysctl.elapsed().as_secs_f64();
 
+    let systemd_sample = "\
+[Service]
+User=raksa
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ExecStart=/usr/local/bin/worker
+";
+    let systemd_iters = 10_000u32;
+    let t_systemd = Instant::now();
+    for _ in 0..systemd_iters {
+        let f = audit_systemd_content(black_box(systemd_sample), "bench.service");
+        black_box(f);
+    }
+    let systemd_elapsed = t_systemd.elapsed().as_secs_f64();
+
+    let fix_sample = "[Service]\nUser=root\nExecStart=/usr/bin/agent\n";
+    let fix_iters = 5_000u32;
+    let t_fix = Instant::now();
+    for _ in 0..fix_iters {
+        let p =
+            generate_fix_preview_content(black_box(fix_sample), "bench.service", FixKind::Systemd)
+                .expect("fix_preview");
+        black_box(p);
+    }
+    let fix_elapsed = t_fix.elapsed().as_secs_f64();
+
     println!(
         "raksa-hostguard v{} benchmark (workers={})",
         raksa_hostguard::VERSION,
@@ -178,5 +206,17 @@ fs.suid_dumpable = 0
         sysctl_iters,
         sysctl_elapsed,
         f64::from(sysctl_iters) / sysctl_elapsed
+    );
+    println!(
+        "audit_systemd                : {} iters | {:.4}s | {:.1} ops/s",
+        systemd_iters,
+        systemd_elapsed,
+        f64::from(systemd_iters) / systemd_elapsed
+    );
+    println!(
+        "fix_preview                  : {} iters | {:.4}s | {:.1} ops/s",
+        fix_iters,
+        fix_elapsed,
+        f64::from(fix_iters) / fix_elapsed
     );
 }
