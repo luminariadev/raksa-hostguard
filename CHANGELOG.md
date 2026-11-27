@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `HOST-308`: `modprobe.d` legacy module blacklists (`cramfs`, `dccp`, `sctp`), `auditd.conf` retention settings, and `audit.rules` identity watches / immutable `-e 2` verification.
 - **Read-Only Unified Patch Generator (`fix-preview`)**: Added `src/fix/` and `fix-preview` CLI subcommand generating deterministic unified diffs (`diff` or `json`) for SSH, sysctl, Dockerfile, Compose, systemd, and `daemon.json`.
 - **Suite Governance Parity**: Added `0-100 (A+..F)` `PostureScore` across JSON/Table/Markdown outputs, deterministic SHA-256 `--baseline` / `--write-baseline` gating (`--findings-baseline` / `--write-findings-baseline` on `fim check`), `.hostguard.yml` auto-discovery on `audit-workspace`, and `markdown` / `ndjson` report formatters.
-- **9-Tool MCP Server & Hardened CI/Container**: Added `hostguard_audit_systemd` and `hostguard_suggest_fix`, extended `hostguard_audit_host` & `hostguard_audit_docker` domain kinds, added `HEALTHCHECK` & version-pinned `rust:1.90-alpine` to `Dockerfile`, and hardened `.github/workflows/ci.yml` + `release.yml` with explicit `permissions:` and 40-char commit SHA pinning.
+- **9-Tool MCP Server & Hardened CI/Container**: Added `hostguard_audit_systemd` and `hostguard_suggest_fix`, extended `hostguard_audit_host` & `hostguard_audit_docker` domain kinds, added `HEALTHCHECK` & version-pinned `rust:1.100-alpine` to `Dockerfile`, and hardened `.github/workflows/ci.yml` + `release.yml` with explicit `permissions:` and 40-char commit SHA pinning.
 
 ## [0.2.0] - 2026-11-26
 

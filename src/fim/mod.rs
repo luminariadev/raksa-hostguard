@@ -4,6 +4,7 @@ pub mod sign;
 use crate::schema::{sanitize_id_part, Finding, Severity, LAYER_HOST, SCHEMA_VERSION, TOOL_NAME};
 use chrono::{DateTime, Utc};
 use hash::{hash_file_streaming, FimError, DEFAULT_MAX_FILE_BYTES};
+use notify::event::{AccessKind, AccessMode, EventKind, MetadataKind, ModifyKind};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map};
@@ -536,6 +537,19 @@ where
     run_events_loop(snapshot, sign_key, config, watcher, rx, on_cycle)
 }
 
+fn is_mutating_notify_event(ev: &notify::Event) -> bool {
+    if ev.need_rescan() {
+        return true;
+    }
+    match ev.kind {
+        EventKind::Create(_) | EventKind::Remove(_) | EventKind::Any => true,
+        EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime)) => false,
+        EventKind::Modify(_) => true,
+        EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
+        EventKind::Access(_) | EventKind::Other => false,
+    }
+}
+
 fn setup_notify_watcher(
     root_paths: &[String],
 ) -> Result<
@@ -546,12 +560,16 @@ fn setup_notify_watcher(
     FimError,
 > {
     let (tx, rx) = mpsc::channel();
-    let mut watcher = notify::recommended_watcher(move |res| {
-        let _ = tx.send(res);
-    })
-    .map_err(|e| {
-        FimError::InvalidInput(format!("failed to initialize OS filesystem watcher: {e}"))
-    })?;
+    let mut watcher =
+        notify::recommended_watcher(move |res: notify::Result<notify::Event>| match &res {
+            Ok(ev) if !is_mutating_notify_event(ev) => {}
+            _ => {
+                let _ = tx.send(res);
+            }
+        })
+        .map_err(|e| {
+            FimError::InvalidInput(format!("failed to initialize OS filesystem watcher: {e}"))
+        })?;
 
     let mut attached = 0usize;
     for root_str in root_paths {
@@ -1093,12 +1111,8 @@ mod tests {
             workers: 2,
         };
 
+        let mut writer_handle: Option<thread::JoinHandle<()>> = None;
         let target_clone = target.clone();
-        let writer_handle = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(120));
-            fs::write(&target_clone, b"PermitRootLogin yes\n").unwrap();
-        });
-
         let started = Instant::now();
         let mut captured = Vec::new();
         watch_snapshot(&snap, None, &cfg, |cycle, fresh| {
@@ -1106,10 +1120,19 @@ mod tests {
                 cycle,
                 fresh.iter().map(|f| f.rule_id.clone()).collect::<Vec<_>>(),
             ));
+            if cycle == 1 {
+                let path = target_clone.clone();
+                writer_handle = Some(thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(150));
+                    fs::write(&path, b"PermitRootLogin yes\n").unwrap();
+                }));
+            }
             true
         })
         .unwrap();
-        writer_handle.join().unwrap();
+        if let Some(handle) = writer_handle {
+            handle.join().unwrap();
+        }
 
         // Kernel notify should trigger cycle 2 quickly (well before the 10s reconciliation timeout).
         assert!(
@@ -1120,5 +1143,44 @@ mod tests {
         assert_eq!(captured.len(), 2);
         assert!(captured[0].1.is_empty());
         assert_eq!(captured[1].1, vec!["HOST-001".to_string()]);
+    }
+
+    #[test]
+    fn is_mutating_notify_event_filters_read_only_access_events() {
+        use notify::event::{CreateKind, DataChange, Event, Flag, RemoveKind};
+
+        assert!(!is_mutating_notify_event(&Event::new(EventKind::Access(
+            AccessKind::Open(AccessMode::Any),
+        ))));
+        assert!(!is_mutating_notify_event(&Event::new(EventKind::Access(
+            AccessKind::Close(AccessMode::Read),
+        ))));
+        assert!(!is_mutating_notify_event(&Event::new(EventKind::Access(
+            AccessKind::Read,
+        ))));
+        assert!(!is_mutating_notify_event(&Event::new(EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::AccessTime),
+        ))));
+        assert!(!is_mutating_notify_event(&Event::new(EventKind::Other)));
+
+        assert!(is_mutating_notify_event(&Event::new(EventKind::Create(
+            CreateKind::File,
+        ))));
+        assert!(is_mutating_notify_event(&Event::new(EventKind::Remove(
+            RemoveKind::File,
+        ))));
+        assert!(is_mutating_notify_event(&Event::new(EventKind::Modify(
+            ModifyKind::Data(DataChange::Any),
+        ))));
+        assert!(is_mutating_notify_event(&Event::new(EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::Permissions),
+        ))));
+        assert!(is_mutating_notify_event(&Event::new(EventKind::Access(
+            AccessKind::Close(AccessMode::Write),
+        ))));
+        assert!(is_mutating_notify_event(&Event::new(EventKind::Any)));
+        assert!(is_mutating_notify_event(
+            &Event::new(EventKind::Other).set_flag(Flag::Rescan)
+        ));
     }
 }
